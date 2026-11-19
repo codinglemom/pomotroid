@@ -1,0 +1,13 @@
+{
+  "name": "Fluent Calm Dark",
+  "colors": {
+    "--color-long-round": "#A2BDDF",
+    "--color-short-round": "#9BC9AB",
+    "--color-focus-round": "#F0A08E",
+    "--color-background": "#202321",
+    "--color-background-light": "#292D2A",
+    "--color-foreground": "#F0F2ED",
+    "--color-foreground-darker": "#C2CCC3",
+    "--color-accent": "#F0A08E"
+  }
+}

@@ -8,10 +8,15 @@ import type {
   TimerState,
   Settings,
   Theme,
+  CueKey,
+  AudioPreset,
   CustomAudioInfo,
   DetailedStats,
   HeatmapStats,
   UpdateInfo,
+  WalletSummary,
+  WalletIncomeHistory,
+  WalletLedgerPage,
 } from '$lib/types';
 
 // --- Timer commands ---
@@ -37,24 +42,52 @@ export const getThemes = () => invoke<Theme[]>('themes_list');
 
 // --- Notification commands ---
 
-export const notificationShow = (title: string, body: string) =>
-  invoke<void>('notification_show', { title, body });
+export const setNotificationLocale = (locale: string) =>
+  invoke<void>('notification_set_locale', { locale });
+/** Submission only; the OS may suppress a queued notification. */
+export const notificationTest = () => invoke<void>('notification_test');
 
 // --- Window commands ---
 
 export const setWindowVisibility = (visible: boolean) =>
   invoke<void>('window_set_visibility', { visible });
+export const openDesktopWidget = () => invoke<void>('window_open_widget');
+export const desktopWidgetReady = () => invoke<void>('window_widget_ready');
+export const restoreMainWindow = () => invoke<void>('window_restore_main');
+
+export type TrayPanelAction =
+  | 'start'
+  | 'pause'
+  | 'resume'
+  | 'skip'
+  | 'reset-round'
+  | 'show'
+  | 'exit'
+  | 'dismiss';
+
+export const trayPanelReady = ({ height }: { height: number }) =>
+  invoke<void>('tray_panel_ready', { height });
+export const trayPanelAction = ({ action }: { action: TrayPanelAction }) =>
+  invoke<void>('tray_panel_action', { action });
+
+/** True means Windows queued the effect request; rendering depends on the OS. */
+export const applyWindowMaterial = (themeMode: 'auto' | 'light' | 'dark', enabled: boolean) =>
+  invoke<boolean>('window_apply_material', { themeMode, enabled });
 
 // --- Audio commands ---
 
 export const getCustomAudioInfo = () => invoke<CustomAudioInfo>('audio_get_custom_info');
 
-/** Copy `srcPath` to the config dir for `cue`; returns the display name. */
-export const setCustomAudio = (cue: string, srcPath: string) =>
+/** Import and select a custom sound for `cue`; returns the display name. */
+export const setCustomAudio = (cue: CueKey, srcPath: string) =>
   invoke<string>('audio_set_custom', { cue, srcPath });
 
-/** Delete the custom file for `cue` and revert to the built-in sound. */
-export const clearCustomAudio = (cue: string) => invoke<void>('audio_clear_custom', { cue });
+/** Delete the custom file for `cue` and select Classic. */
+export const clearCustomAudio = (cue: CueKey) => invoke<void>('audio_clear_custom', { cue });
+
+export const setAudioPreset = (cue: CueKey, preset: AudioPreset) =>
+  invoke<void>('audio_set_preset', { cue, preset });
+export const previewAudio = (cue: CueKey) => invoke<void>('audio_preview', { cue });
 
 /** Open a native file picker filtered to audio formats. Returns a path or null. */
 export const openAudioFilePicker = (): Promise<string | null> =>
@@ -85,6 +118,22 @@ export const statsGetDetailed = () => invoke<DetailedStats>('stats_get_detailed'
 
 /** Heatmap entries + lifetime totals (All Time tab). */
 export const statsGetHeatmap = () => invoke<HeatmapStats>('stats_get_heatmap');
+
+// --- Reward wallet commands ---
+
+export const walletGetSummary = () => invoke<WalletSummary>('wallet_get_summary');
+export const walletGetIncomeHistory = (days: 7 | 30 = 7) =>
+  invoke<WalletIncomeHistory>('wallet_get_income_history', { days });
+export const walletGetLedger = (beforeId: number | null = null) =>
+  invoke<WalletLedgerPage>('wallet_get_ledger', { beforeId });
+export const walletSetRate = (rateMinorPerHour: number) =>
+  invoke<void>('wallet_set_rate', { rateMinorPerHour });
+export const walletSpend = (amountMinor: number, note: string, requestId: string) =>
+  invoke<void>('wallet_spend', { amountMinor, note, requestId });
+export const onWalletChanged = (cb: () => void): Promise<UnlistenFn> =>
+  listen<void>('wallet:changed', () => cb());
+export const onWalletError = (cb: () => void): Promise<UnlistenFn> =>
+  listen<void>('wallet:error', () => cb());
 
 // --- Platform commands ---
 
@@ -126,6 +175,23 @@ export const onTimerReset = (cb: (state: TimerState) => void): Promise<UnlistenF
 
 export const onSettingsChanged = (cb: (settings: Settings) => void): Promise<UnlistenFn> =>
   listen<Settings>('settings:changed', (e) => cb(e.payload));
+
+// Catch changes made while the new window was loading its theme and fonts.
+export async function watchWindowSettings(cb: (settings: Settings) => void): Promise<UnlistenFn> {
+  let received = false;
+  const stop = await onSettingsChanged((value) => {
+    received = true;
+    cb(value);
+  });
+  try {
+    const snapshot = await getSettings();
+    if (!received) cb(snapshot);
+  } catch (error) {
+    stop();
+    throw error;
+  }
+  return stop;
+}
 
 export const onThemesChanged = (cb: (themes: Theme[]) => void): Promise<UnlistenFn> =>
   listen<Theme[]>('themes:changed', (e) => cb(e.payload));

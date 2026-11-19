@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { DailyStats } from '$lib/types';
+  import RewardSummary from '../RewardSummary.svelte';
   import * as m from '$paraglide/messages.js';
 
   let { today }: { today: DailyStats | null } = $props();
@@ -32,20 +33,22 @@
 <div class="view">
   <!-- Stat cards -->
   <div class="cards">
-    <div class="card" style="--delay: 0ms">
+    <div class="card">
       <span class="card-label">{m.stats_rounds()}</span>
       <span class="card-value">{today?.rounds ?? '—'}</span>
     </div>
     <div class="card-divider"></div>
-    <div class="card" style="--delay: 60ms">
+    <div class="card">
       <span class="card-label">{m.stats_focus_time()}</span>
       <span class="card-value">{today ? fmtTime(today.focus_mins) : '—'}</span>
     </div>
     <div class="card-divider"></div>
-    <div class="card" style="--delay: 120ms">
+    <div class="card">
       <span class="card-label">{m.stats_completion()}</span>
       <span class="card-value">{today ? fmtRate(today.completion_rate) : '—'}</span>
     </div>
+    <div class="card-divider"></div>
+    <div class="card"><RewardSummary /></div>
   </div>
 
   <!-- Hourly breakdown -->
@@ -78,7 +81,6 @@
             rx="2"
             class="bar"
             class:bar-empty={count === 0}
-            style="--bar-scale: {barH / CHART_H}; --bar-delay: {h * 18}ms"
           />
 
           <!-- Hour label (every 6 hours) -->
@@ -103,7 +105,6 @@
     gap: 0;
     height: 100%;
     padding: 0;
-    animation: app-fade-in 0.2s ease;
   }
 
   /* ── Stat cards ──────────────────────────────────────────── */
@@ -115,25 +116,13 @@
 
   .card {
     flex: 1;
+    min-width: 0;
     display: flex;
     flex-direction: column;
     align-items: center;
     justify-content: center;
     gap: 6px;
-    padding: 28px 24px;
-    animation: card-rise 0.35s cubic-bezier(0.22, 1, 0.36, 1) both;
-    animation-delay: var(--delay, 0ms);
-  }
-
-  @keyframes card-rise {
-    from {
-      opacity: 0;
-      transform: translateY(8px);
-    }
-    to {
-      opacity: 1;
-      transform: translateY(0);
-    }
+    padding: 28px 12px;
   }
 
   .card-label {
@@ -145,7 +134,7 @@
   }
 
   .card-value {
-    font-size: 2.4rem;
+    font-size: clamp(1.5rem, 3.8vw, 2.1rem);
     font-weight: 700;
     font-variant-numeric: tabular-nums;
     letter-spacing: -0.02em;
@@ -203,26 +192,10 @@
   .bar {
     fill: var(--color-focus-round);
     opacity: 0.85;
-    transform-origin: bottom;
-    transform-box: fill-box;
-    animation: bar-rise 0.4s cubic-bezier(0.22, 1, 0.36, 1) both;
-    animation-delay: var(--bar-delay, 0ms);
-  }
-
-  @keyframes bar-rise {
-    from {
-      transform: scaleY(0.05);
-      opacity: 0;
-    }
-    to {
-      transform: scaleY(1);
-      opacity: 0.85;
-    }
   }
 
   .bar-empty {
     fill: color-mix(in oklch, var(--color-foreground) 8%, transparent);
-    animation: none;
   }
 
   .hour-label {
@@ -235,5 +208,37 @@
   .baseline {
     stroke: var(--color-separator);
     stroke-width: 1;
+  }
+
+  .cards {
+    padding: 24px;
+    gap: 24px;
+  }
+  .card {
+    align-items: flex-start;
+    padding: 0;
+    gap: 8px;
+  }
+  .card-divider {
+    display: none;
+  }
+  .card-label,
+  .section-title {
+    font-size: 12px;
+    letter-spacing: 0;
+    text-transform: none;
+  }
+  .card-value {
+    font-size: 28px;
+    font-weight: 550;
+    line-height: 36px;
+  }
+  .hour-label {
+    font-size: 11px;
+  }
+  .empty-hint {
+    color: var(--color-foreground-darker);
+    font-size: 12px;
+    font-style: normal;
   }
 </style>

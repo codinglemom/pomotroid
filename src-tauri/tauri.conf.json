@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Pomotroid",
+  "productName": "小番茄",
   "version": "1.7.1",
   "identifier": "com.splode.pomotroid",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Pomotroid",
+        "title": "小番茄",
         "width": 360,
         "height": 478,
         "minWidth": 240,
@@ -52,7 +52,7 @@
     "category": "Utility",
     "copyright": "Copyright © 2017–2026 Christopher Murphy (Splode). MIT License.",
     "shortDescription": "A beautiful Pomodoro timer",
-    "longDescription": "Pomotroid is a simple, configurable and visually pleasing Pomodoro timer. Keep track of your work sessions and take breaks with a clean, themeable interface.",
+    "longDescription": "小番茄 is a configurable Pomodoro timer for focus sessions and breaks.",
     "linux": {
       "deb": {
         "depends": []
@@ -87,13 +87,18 @@
     },
     "windows": {
       "nsis": {
+        "template": "installer/wizard.nsi",
+        "languages": ["SimpChinese", "English"],
         "displayLanguageSelector": false,
         "installerIcon": "icons/icon.ico",
-        "headerImage": "icons/128x128.png",
+        "sidebarImage": "installer/art/welcome.bmp",
+        "headerImage": "installer/art/header.bmp",
+        "uninstallerIcon": "icons/icon.ico",
         "installMode": "perMachine"
       },
       "wix": {
-        "language": "en-US"
+        "upgradeCode": "35dea329-b545-5282-9fdd-b3638d4825f7",
+        "language": "zh-CN"
       }
     }
   }

@@ -1,6 +1,5 @@
 <script lang="ts">
-  // Orchestrator component. Subscribes to timer events, owns keyboard listener,
-  // and renders TimerDial + TimerDisplay + TimerFooter.
+  // Share the live timer subscription between the main and floating views.
   import { onMount } from 'svelte';
   import {
     timerToggle,
@@ -15,261 +14,261 @@
   } from '$lib/ipc';
   import { timerState } from '$lib/stores/timer';
   import { settings } from '$lib/stores/settings';
-  import { fade } from 'svelte/transition';
   import TimerDial from './TimerDial.svelte';
   import TimerDisplay from './TimerDisplay.svelte';
   import TimerFooter from './TimerFooter.svelte';
+  import DesktopWidget from './DesktopWidget.svelte';
   import MiniControls from './MiniControls.svelte';
   import Tooltip from './Tooltip.svelte';
+  import Icon from './Icon.svelte';
   import type { UnlistenFn } from '@tauri-apps/api/event';
+  import { error as logError } from '@tauri-apps/plugin-log';
   import * as m from '$paraglide/messages.js';
-  import { notificationShow } from '$lib/ipc';
 
   interface Props {
     isCompact?: boolean;
     uiScale?: number;
+    widget?: boolean;
+    widgetSettingsReady?: boolean;
+    onInitError?: () => void;
   }
 
-  let { isCompact = false, uiScale = 1 }: Props = $props();
+  let {
+    isCompact = false,
+    uiScale = 1,
+    widget = false,
+    widgetSettingsReady = false,
+    onInitError,
+  }: Props = $props();
 
-  let state = $derived($timerState);
-
-  function roundColor(rt: string): string {
-    if (rt === 'work') return 'var(--color-focus-round)';
-    if (rt === 'short-break') return 'var(--color-short-round)';
-    return 'var(--color-long-round)';
-  }
-
-  function roundLabel(rt: string): string {
-    if (rt === 'work') return m.round_label_work();
-    if (rt === 'short-break') return m.round_label_short_break();
-    return m.round_label_long_break();
-  }
+  let snapshot = $derived($timerState);
+  let hydrated = $state(false);
+  const round = $derived(
+    snapshot.round_type === 'work'
+      ? 'focus-round'
+      : snapshot.round_type === 'short-break'
+        ? 'short-round'
+        : 'long-round'
+  );
 
   onMount(() => {
     const cleanups: UnlistenFn[] = [];
+    let disposed = false;
+
+    async function register(listener: Promise<UnlistenFn>) {
+      const unlisten = await listener;
+      if (disposed) unlisten();
+      else cleanups.push(unlisten);
+    }
 
     // Async setup: hydrate state and register event listeners.
     (async () => {
-      const initial = await getTimerState();
-      timerState.set(initial);
-
-      cleanups.push(
-        await onTimerTick(({ elapsed_secs, total_secs }) => {
-          timerState.update((s) => ({
-            ...s,
-            elapsed_secs,
-            total_secs,
-            is_running: true,
-            is_paused: false,
-          }));
-        }),
-        await onTimerPaused(({ elapsed_secs }) => {
-          timerState.update((s) => ({
-            ...s,
-            elapsed_secs,
-            is_running: false,
-            is_paused: true,
-          }));
-        }),
-        await onTimerResumed(({ elapsed_secs }) => {
-          timerState.update((s) => ({
-            ...s,
-            elapsed_secs,
-            is_running: true,
-            is_paused: false,
-          }));
-        }),
-        await onRoundChange((snap) => {
-          timerState.set(snap);
-          if ($settings.notifications_enabled) {
-            let title: string;
-            let body: string;
-            if (snap.round_type === 'work') {
-              const afterBreak =
-                snap.previous_round_type === 'short-break' ||
-                snap.previous_round_type === 'long-break';
-              title = afterBreak ? m.notification_work_title() : m.notification_work_start_title();
-              body = afterBreak ? m.notification_work_body() : m.notification_work_start_body();
-            } else if (snap.round_type === 'short-break') {
-              title = m.notification_short_break_title();
-              body = m.notification_short_break_body();
-            } else {
-              title = m.notification_long_break_title();
-              body = m.notification_long_break_body();
-            }
-            notificationShow(title, body).catch(() => {});
-          }
-        }),
-        await onTimerReset((snap) => {
-          timerState.set(snap);
-        })
-      );
-    })();
+      await Promise.all([
+        register(
+          onTimerTick(({ elapsed_secs, total_secs }) => {
+            timerState.update((s) => ({
+              ...s,
+              elapsed_secs,
+              total_secs,
+              is_running: true,
+              is_paused: false,
+            }));
+          })
+        ),
+        register(
+          onTimerPaused(({ elapsed_secs }) => {
+            timerState.update((s) => ({
+              ...s,
+              elapsed_secs,
+              is_running: false,
+              is_paused: true,
+            }));
+          })
+        ),
+        register(
+          onTimerResumed(({ elapsed_secs }) => {
+            timerState.update((s) => ({
+              ...s,
+              elapsed_secs,
+              is_running: true,
+              is_paused: false,
+            }));
+          })
+        ),
+        register(onRoundChange(timerState.set)),
+        register(onTimerReset(timerState.set)),
+      ]);
+      // Subscribe before hydration so a reconstructed window does not miss a
+      // transition while requesting the current running or paused snapshot.
+      const snapshot = await getTimerState();
+      if (!disposed) {
+        timerState.set(snapshot);
+        hydrated = true;
+      }
+    })().catch((error) => {
+      if (disposed) return;
+      void logError(`[timer] initialization failed: ${error}`).catch(() => {});
+      onInitError?.();
+    });
 
     return () => {
+      disposed = true;
       for (const unlisten of cleanups) unlisten();
     };
   });
 </script>
 
-<div class="timer-outer" class:compact={isCompact}>
-  <div class="timer" style="zoom: {uiScale}">
-    <!-- Dial + display stacked (display centered over dial) -->
-    <div class="dial-stack">
-      <TimerDial snap={state} countdown={$settings.dial_countdown} />
-      <TimerDisplay {state} />
-    </div>
-
-    {#if !isCompact}
-      <!-- Round type label sits below the dial as a normal flex child so it
-           does not affect the dial-stack height used to centre TimerDisplay. -->
-      <div class="round-label" style="color: {roundColor(state.round_type)}">
-        {roundLabel(state.round_type)}
+{#if widget}
+  <DesktopWidget
+    {snapshot}
+    {round}
+    styleName={$settings.timer_style === 'ring' ? 'nixie' : $settings.timer_style}
+    countdown={$settings.dial_countdown}
+    ready={widgetSettingsReady && hydrated}
+  />
+{:else}
+  <div
+    class="timer-outer"
+    class:compact={isCompact}
+    style="--round-color:var(--color-{round}); --round-ink:var(--color-on-{round}); --timer-scale:{uiScale}"
+  >
+    <div class="timer" style="zoom:{uiScale}">
+      <div class="dial-stack" class:desk={$settings.timer_style !== 'ring'}>
+        {#if $settings.timer_style === 'ring'}
+          <TimerDial snap={snapshot} countdown={$settings.dial_countdown} />
+        {/if}
+        <TimerDisplay state={snapshot} compact={isCompact} styleName={$settings.timer_style} />
       </div>
-
-      <div class="controls-wrapper">
-        <!-- Back: restart current round -->
-        <Tooltip text={m.tooltip_restart_round()}>
-          <button class="btn-side" onclick={timerRestartRound} aria-label="Restart round">
-            <svg width="18" height="18" viewBox="0 0 16 16">
-              <polygon points="15,1 6,8 15,15" fill="currentColor" />
-              <rect x="1" y="1" width="3" height="14" rx="1" fill="currentColor" />
-            </svg>
-          </button>
-        </Tooltip>
-
-        <!-- Play / Pause — icon fades when state changes -->
-        <button
-          class="play-pause"
-          onclick={timerToggle}
-          aria-label={state.is_running ? 'Pause' : 'Play'}
+      {#if !isCompact}
+        <div
+          class="rounds"
+          aria-label={$settings.long_breaks_enabled
+            ? m.ui_round_progress({
+                current: snapshot.work_round_number,
+                total: snapshot.work_rounds_total,
+              })
+            : m.timer_session_round({ n: snapshot.session_work_count })}
         >
-          {#key state.is_running}
-            <span class="icon" in:fade={{ duration: 120 }}>
-              {#if state.is_running}
-                <svg width="24" height="24" viewBox="0 0 24 24">
-                  <rect x="5" y="3" width="5" height="18" rx="1.5" fill="currentColor" />
-                  <rect x="14" y="3" width="5" height="18" rx="1.5" fill="currentColor" />
-                </svg>
-              {:else}
-                <svg width="18" height="18" viewBox="0 0 24 24" style="overflow: visible;">
-                  <polygon points="4,0 28,12 4,24" fill="currentColor" />
-                </svg>
-              {/if}
-            </span>
-          {/key}
-        </button>
-
-        <!-- Skip: advance to next round -->
-        <Tooltip text={m.tooltip_skip()}>
-          <button class="btn-side" onclick={timerSkip} aria-label="Skip round">
-            <svg width="18" height="18" viewBox="0 0 16 16">
-              <polygon points="1,1 10,8 1,15" fill="currentColor" />
-              <rect x="12" y="1" width="3" height="14" rx="1" fill="currentColor" />
-            </svg>
-          </button>
-        </Tooltip>
-
-        <TimerFooter snap={state} />
-      </div>
-    {/if}
+          {#if $settings.long_breaks_enabled && snapshot.work_rounds_total <= 12}
+            <span class="dots" aria-hidden="true"
+              >{#each Array(snapshot.work_rounds_total) as _, index}<i
+                  class:done={index < snapshot.work_round_number}
+                ></i>{/each}</span
+            >
+          {/if}
+          <span
+            >{$settings.long_breaks_enabled
+              ? m.ui_round_progress({
+                  current: snapshot.work_round_number,
+                  total: snapshot.work_rounds_total,
+                })
+              : m.timer_session_round({ n: snapshot.session_work_count })}</span
+          >
+        </div>
+        <div class="controls-wrapper">
+          <Tooltip text={m.tooltip_restart_round()}
+            ><button
+              class="ui-button ui-icon-button"
+              onclick={timerRestartRound}
+              aria-label={m.tooltip_restart_round()}><Icon name="restart" /></button
+            ></Tooltip
+          >
+          <button class="play-pause" onclick={timerToggle}
+            ><Icon name={snapshot.is_running ? 'pause' : 'play'} />{snapshot.is_running
+              ? m.ui_pause()
+              : snapshot.is_paused
+                ? m.ui_resume()
+                : m.ui_start()}</button
+          >
+          <Tooltip text={m.tooltip_skip()}
+            ><button
+              class="ui-button ui-icon-button"
+              onclick={timerSkip}
+              aria-label={m.tooltip_skip()}><Icon name="skip" /></button
+            ></Tooltip
+          >
+        </div>
+        <TimerFooter />
+      {/if}
+    </div>
+    {#if isCompact}<MiniControls />{/if}
   </div>
-
-  {#if isCompact}
-    <MiniControls />
-  {/if}
-</div>
+{/if}
 
 <style>
-  .timer-outer {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 8px;
-  }
-
+  .timer-outer,
   .timer {
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: 16px;
   }
-
+  .timer-outer {
+    gap: 10px;
+  }
   .dial-stack {
     position: relative;
     display: flex;
     align-items: center;
     justify-content: center;
   }
-
-  .controls-wrapper {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 4px 12px;
+  .desk {
+    width: 282px;
+    height: 224px;
   }
-  .controls-wrapper > :global(*) {
-    aspect-ratio: 1;
+  .compact .desk {
+    width: 218px;
   }
-
-  .btn-side {
-    background: none;
-    border: none;
-    cursor: pointer;
-    color: var(--color-foreground-darker, var(--color-foreground));
+  .rounds {
     display: flex;
     align-items: center;
     justify-content: center;
-    width: 32px;
-    height: 32px;
-    border-radius: 4px;
-    transition:
-      color var(--transition-default),
-      background var(--transition-default);
+    gap: 12px;
+    margin-top: 12px;
+    min-height: 20px;
+    font-size: 12px;
+    color: var(--color-foreground-darker);
   }
-
-  .btn-side:hover {
-    color: var(--color-foreground);
-    background: var(--color-hover);
-  }
-
-  .play-pause {
-    background: none;
-    border: none;
-    cursor: pointer;
-    color: var(--color-foreground);
+  .dots {
     display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 48px;
-    height: 48px;
+    gap: 5px;
+  }
+  .dots i {
+    display: block;
+    width: 5px;
+    height: 5px;
     border-radius: 50%;
-    border: 2px solid var(--color-foreground-darker, var(--color-foreground));
-    transition:
-      color var(--transition-default),
-      border-color var(--transition-default),
-      background var(--transition-default);
-    overflow: hidden; /* clip the fading icon within the circle */
+    background: var(--color-separator);
   }
-
-  .play-pause:hover {
-    color: var(--color-accent);
-    border-color: var(--color-accent);
-    background: var(--color-hover);
+  .dots i.done {
+    background: var(--round-color);
   }
-
-  .icon {
+  .controls-wrapper {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    margin-top: 20px;
+  }
+  .play-pause {
+    min-width: 128px;
+    height: 44px;
+    padding: 0 16px;
+    border: 0;
+    border-radius: 6px;
+    background: var(--round-color);
+    color: var(--round-ink);
     display: flex;
     align-items: center;
     justify-content: center;
+    gap: 8px;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: filter var(--transition-snappy);
   }
-
-  .round-label {
-    font-size: 0.75rem;
-    font-weight: 600;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    /* Collapse the gap above: the flex gap already provides spacing from the dial. */
-    margin-top: -8px;
+  .play-pause:hover {
+    filter: brightness(0.95);
+  }
+  .play-pause:active {
+    filter: brightness(0.9);
   }
 </style>

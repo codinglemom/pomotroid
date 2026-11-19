@@ -3,16 +3,28 @@
   import { onMount } from 'svelte';
   import Titlebar from '$lib/components/Titlebar.svelte';
   import Timer from '$lib/components/Timer.svelte';
-  import { getSettings, getThemes, onSettingsChanged, onThemesChanged } from '$lib/ipc';
+  import {
+    getThemes,
+    watchWindowSettings,
+    onThemesChanged,
+    setWindowVisibility,
+    restoreMainWindow,
+  } from '$lib/ipc';
   import { settings } from '$lib/stores/settings';
   import { applyTheme } from '$lib/stores/theme';
   import { resolveThemeName } from '$lib/utils/theme';
   import { isMac } from '$lib/utils/platform';
   import { setLocale } from '$lib/locale.svelte.js';
+  import { isTauri } from '@tauri-apps/api/core';
   import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
   import type { UnlistenFn } from '@tauri-apps/api/event';
   import { info, error as logError } from '@tauri-apps/plugin-log';
   import { createLocalShortcutHandler } from '$lib/utils/localShortcuts';
+  import type { Theme } from '$lib/types';
+
+  const isWidget = isTauri() && getCurrentWebviewWindow().label === 'widget';
+  const windowLabel = isWidget ? 'widget' : 'main';
+  let widgetSettingsReady = $state(false);
 
   // Local shortcut state — volume and fullscreen tracked separately so the
   // handler can read current values without waiting for settings:changed round-trip.
@@ -39,6 +51,8 @@
   const COMPACT_BOTTOM_PAD = 48;
 
   $effect(() => {
+    if (isWidget) return;
+
     function update() {
       const w = window.innerWidth;
       const h = window.innerHeight;
@@ -63,130 +77,146 @@
     await getCurrentWebviewWindow().startResizeDragging(direction as any);
   }
 
+  function restoreAfterWidgetInitError() {
+    void restoreMainWindow().catch((error) => {
+      void logError(`[widget] initialization recovery failed: ${error}`).catch(() => {});
+    });
+  }
+
   onMount(() => {
     const cleanups: UnlistenFn[] = [];
+    let disposed = false;
 
-    // Mount local keyboard shortcut handler.
-    const shortcutHandler = createLocalShortcutHandler({
-      getSettings: () => $settings,
-      getVolume: () => localVolume,
-      setVolume: (v) => {
-        localVolume = v;
-      },
-      getPreMuteVolume: () => preMuteVolume,
-      setPreMuteVolume: (v) => {
-        preMuteVolume = v;
-      },
-      getFullscreen: () => isFullscreen,
-      setFullscreen: (v) => {
-        isFullscreen = v;
-      },
-    });
-    document.addEventListener('keydown', shortcutHandler);
-    cleanups.push(() => document.removeEventListener('keydown', shortcutHandler));
+    if (isWidget) {
+      document.documentElement.classList.add('desktop-widget-window');
+      cleanups.push(() => document.documentElement.classList.remove('desktop-widget-window'));
+    } else {
+      const shortcutHandler = createLocalShortcutHandler({
+        getSettings: () => $settings,
+        getVolume: () => localVolume,
+        setVolume: (v) => {
+          localVolume = v;
+        },
+        getPreMuteVolume: () => preMuteVolume,
+        setPreMuteVolume: (v) => {
+          preMuteVolume = v;
+        },
+        getFullscreen: () => isFullscreen,
+        setFullscreen: (v) => {
+          isFullscreen = v;
+        },
+      });
+      document.addEventListener('keydown', shortcutHandler);
+      cleanups.push(() => document.removeEventListener('keydown', shortcutHandler));
+    }
+
+    const colorScheme = window.matchMedia('(prefers-color-scheme: dark)');
+    let themes: Theme[] | undefined;
+    let localeReady: Promise<void> | undefined;
+
+    function applyActiveTheme() {
+      const name = resolveThemeName($settings, colorScheme.matches);
+      const active = themes?.find((theme) => theme.name === name) ?? themes?.[0];
+      if (active) return applyTheme(active, { syncMaterial: !isWidget });
+    }
+
+    const onColorSchemeChange = () => {
+      if ($settings.theme_mode === 'auto') void applyActiveTheme();
+    };
+    colorScheme.addEventListener('change', onColorSchemeChange);
+    cleanups.push(() => colorScheme.removeEventListener('change', onColorSchemeChange));
 
     (async () => {
-      try {
-        // Load settings from backend.
-        const s = await getSettings();
-        settings.set(s);
-        localVolume = s.volume;
+      const stopSettings = await watchWindowSettings((updated) => {
+        if (disposed) return;
+        const previous = $settings;
+        settings.set(updated);
+        if (!isWidget) localVolume = updated.volume;
+        if (!localeReady || updated.language !== previous.language) {
+          localeReady = setLocale(updated.language, { syncNotifications: !isWidget });
+        }
+        if (
+          updated.theme_mode !== previous.theme_mode ||
+          updated.theme_light !== previous.theme_light ||
+          updated.theme_dark !== previous.theme_dark
+        ) {
+          void applyActiveTheme();
+        }
+      });
+      if (disposed) return stopSettings();
+      cleanups.push(stopSettings);
 
-        // Apply the stored locale on mount.
-        setLocale(s.language);
-        await info(`[main] settings loaded, locale=${s.language}`);
+      const stopThemes = await onThemesChanged((updated) => {
+        if (disposed) return;
+        themes = updated;
+        void applyActiveTheme();
+      });
+      if (disposed) return stopThemes();
+      cleanups.push(stopThemes);
 
-        // Load and apply the active theme using OS color scheme.
-        const themes = await getThemes();
-        const osDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-        const active = themes.find((t) => t.name === resolveThemeName(s, osDark)) ?? themes[0];
-        if (active) applyTheme(active);
-        await getCurrentWebviewWindow().show();
-        await info(`[main] initialized, theme=${active?.name ?? 'none'}`);
-      } catch (e) {
-        await logError(`[main] initialization failed: ${e}`);
-        throw e;
+      const initialThemes = await getThemes();
+      if (disposed) return;
+      themes ??= initialThemes;
+      await applyActiveTheme();
+      await localeReady;
+      if (disposed) return;
+      if (isWidget) {
+        widgetSettingsReady = true;
+      } else {
+        await setWindowVisibility(true);
+        void info(`[main] initialized, locale=${$settings.language}`).catch(() => {});
       }
-
-      // Live OS color scheme changes — re-resolve only in auto mode.
-      const mq = window.matchMedia('(prefers-color-scheme: dark)');
-      const mqListener = async (e: MediaQueryListEvent) => {
-        if ($settings.theme_mode !== 'auto') return;
-        const allThemes = await getThemes();
-        const t = allThemes.find((th) => th.name === resolveThemeName($settings, e.matches));
-        if (t) applyTheme(t);
-      };
-      mq.addEventListener('change', mqListener);
-      cleanups.push(() => mq.removeEventListener('change', mqListener));
-
-      // Keep settings store in sync with backend changes.
-      cleanups.push(
-        await onSettingsChanged(async (updated) => {
-          const prevMode = $settings.theme_mode;
-          const prevLight = $settings.theme_light;
-          const prevDark = $settings.theme_dark;
-          const prevLanguage = $settings.language;
-          settings.set(updated);
-          localVolume = updated.volume;
-          if (updated.language !== prevLanguage) {
-            setLocale(updated.language);
-          }
-          if (
-            updated.theme_mode !== prevMode ||
-            updated.theme_light !== prevLight ||
-            updated.theme_dark !== prevDark
-          ) {
-            const allThemes = await getThemes();
-            const dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-            const t = allThemes.find((th) => th.name === resolveThemeName(updated, dark));
-            if (t) applyTheme(t);
-          }
-        }),
-        // Re-apply theme when custom themes are hot-reloaded.
-        await onThemesChanged((updated) => {
-          const dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-          const current =
-            updated.find((t) => t.name === resolveThemeName($settings, dark)) ?? updated[0];
-          if (current) applyTheme(current);
-        })
-      );
-    })();
+    })().catch((error) => {
+      if (disposed) return;
+      void logError(`[${windowLabel}] initialization failed: ${error}`).catch(() => {});
+      if (isWidget) restoreAfterWidgetInitError();
+    });
 
     return () => {
+      disposed = true;
       for (const fn of cleanups) fn();
     };
   });
 </script>
 
-<!-- Resize handles — invisible edge/corner strips for decorations-free windows.
-     Not needed on macOS where native resizing is provided by decorations:true. -->
-{#if !isMac}
-  <!-- N -->
-  <div class="rh rh-n" onmousedown={() => startResize('North')} role="none"></div>
-  <!-- S -->
-  <div class="rh rh-s" onmousedown={() => startResize('South')} role="none"></div>
-  <!-- E -->
-  <div class="rh rh-e" onmousedown={() => startResize('East')} role="none"></div>
-  <!-- W -->
-  <div class="rh rh-w" onmousedown={() => startResize('West')} role="none"></div>
-  <!-- NE -->
-  <div class="rh rh-ne" onmousedown={() => startResize('NorthEast')} role="none"></div>
-  <!-- NW -->
-  <div class="rh rh-nw" onmousedown={() => startResize('NorthWest')} role="none"></div>
-  <!-- SE -->
-  <div class="rh rh-se" onmousedown={() => startResize('SouthEast')} role="none"></div>
-  <!-- SW -->
-  <div class="rh rh-sw" onmousedown={() => startResize('SouthWest')} role="none"></div>
+{#if isWidget}
+  <Timer widget {widgetSettingsReady} onInitError={restoreAfterWidgetInitError} />
+{:else}
+  <!-- Resize handles — invisible edge/corner strips for decorations-free windows.
+       Not needed on macOS where native resizing is provided by decorations:true. -->
+  {#if !isMac}
+    <!-- N -->
+    <div class="rh rh-n" onmousedown={() => startResize('North')} role="none"></div>
+    <!-- S -->
+    <div class="rh rh-s" onmousedown={() => startResize('South')} role="none"></div>
+    <!-- E -->
+    <div class="rh rh-e" onmousedown={() => startResize('East')} role="none"></div>
+    <!-- W -->
+    <div class="rh rh-w" onmousedown={() => startResize('West')} role="none"></div>
+    <!-- NE -->
+    <div class="rh rh-ne" onmousedown={() => startResize('NorthEast')} role="none"></div>
+    <!-- NW -->
+    <div class="rh rh-nw" onmousedown={() => startResize('NorthWest')} role="none"></div>
+    <!-- SE -->
+    <div class="rh rh-se" onmousedown={() => startResize('SouthEast')} role="none"></div>
+    <!-- SW -->
+    <div class="rh rh-sw" onmousedown={() => startResize('SouthWest')} role="none"></div>
+  {/if}
+
+  <div class="app">
+    <Titlebar />
+    <main class:compact={isCompact}>
+      <Timer {isCompact} {uiScale} />
+    </main>
+  </div>
 {/if}
 
-<div class="app">
-  <Titlebar />
-  <main class:compact={isCompact}>
-    <Timer {isCompact} {uiScale} />
-  </main>
-</div>
-
 <style>
+  :global(html.desktop-widget-window),
+  :global(html.desktop-widget-window body) {
+    background: transparent;
+  }
+
   .app {
     width: 100%;
     height: 100%;

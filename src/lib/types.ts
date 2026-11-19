@@ -16,6 +16,8 @@ export interface TimerState {
   session_work_count: number; // monotonic focus round count since last reset
 }
 
+export type TimerStyle = 'ring' | 'flip' | 'nixie' | 'hourglass';
+
 /** Mirrors Rust `Settings` struct returned by `settings_get`. */
 export interface Settings {
   time_work_secs: number;
@@ -44,7 +46,9 @@ export interface Settings {
   theme_mode: string; // 'auto' | 'light' | 'dark'
   theme_light: string;
   theme_dark: string;
+  acrylic_transparency: number; // integer 0–100
   dial_countdown: boolean;
+  timer_style: TimerStyle;
   language: string; // 'auto' | 'en' | 'es' | 'fr' | 'de' | 'ja'
   verbose_logging: boolean;
   check_for_updates: boolean;
@@ -65,11 +69,15 @@ export interface UpdateInfo {
   date: string | null;
 }
 
-/** Mirrors Rust `CustomAudioInfo` — null means the built-in sound is active. */
+export type CueKey = 'work_alert' | 'short_break_alert' | 'long_break_alert';
+export type AudioPreset = 'classic' | 'soft-bell' | 'marimba' | 'droplet' | 'custom';
+
+/** Saved filenames and active presets returned by `audio_get_custom_info`. */
 export interface CustomAudioInfo {
   work_alert: string | null;
   short_break_alert: string | null;
   long_break_alert: string | null;
+  presets: Record<CueKey, AudioPreset>;
 }
 
 /** Mirrors Rust `Theme` struct. Color keys include the `--` CSS var prefix. */
@@ -118,4 +126,40 @@ export interface HeatmapStats {
   total_rounds: number;
   total_hours: number;
   longest_streak: number;
+}
+// Money is always an integer number of CNY fen, within Number.MAX_SAFE_INTEGER.
+export interface WalletSummary {
+  rate_minor_per_hour: number | null;
+  balance_minor: number;
+  income_minor: number;
+  today_income_minor: number;
+  expense_minor: number;
+}
+
+export interface WalletDailyIncome {
+  date: string;
+  income_minor: number;
+}
+
+export interface WalletIncomeHistory {
+  as_of_local_date: string;
+  previous_income_minor: number;
+  days: WalletDailyIncome[];
+}
+
+export interface WalletLedgerEntry {
+  id: number;
+  source_session_id: number | null;
+  kind: 'income' | 'expense';
+  amount_minor: number;
+  created_at: number;
+  note: string;
+  duration_secs: number | null;
+  rate_minor_per_hour: number | null;
+  started_at: number | null;
+}
+
+export interface WalletLedgerPage {
+  entries: WalletLedgerEntry[];
+  has_more: boolean;
 }

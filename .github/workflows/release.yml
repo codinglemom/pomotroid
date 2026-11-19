@@ -272,7 +272,7 @@ jobs:
       - name: Generate latest.json updater manifest
         run: |
           VERSION="${{ needs.changelog.outputs.version }}"
-          REPO="https://github.com/Splode/pomotroid"
+          REPO="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
           PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
           # Derive actual filenames from the downloaded artifacts rather than
@@ -311,8 +311,9 @@ jobs:
         run: |
           VERSION="${{ needs.changelog.outputs.version }}"
           HASH="${{ needs.build-windows.outputs.installer_hash }}"
-          jq --arg v "$VERSION" --arg h "$HASH" \
-            '.version = $v | .hash = $h | .url = "https://github.com/Splode/pomotroid/releases/download/v\($v)/Pomotroid_\($v)_x64-setup.exe#/dl.exe"' \
+          WINDOWS_URL=$(jq -er '.platforms["windows-x86_64"].url' latest.json)
+          jq --arg v "$VERSION" --arg h "$HASH" --arg url "$WINDOWS_URL" \
+            '.version = $v | .hash = $h | .url = ($url + "#/dl.exe")' \
             pomotroid.json > pomotroid.json.tmp && mv pomotroid.json.tmp pomotroid.json
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"

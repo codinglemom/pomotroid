@@ -1,3 +1,10 @@
+<script module lang="ts">
+  // A page revisited during a save must read audio settings after that save.
+  let pendingAudioChange: Promise<unknown> | null = null;
+  let pendingVolumeChange = Promise.resolve();
+  let volumeRevision = 0;
+</script>
+
 <script lang="ts">
   import { onMount } from 'svelte';
   import { settings } from '$lib/stores/settings';
@@ -7,76 +14,86 @@
     setCustomAudio,
     clearCustomAudio,
     openAudioFilePicker,
-    onSettingsChanged,
+    setAudioPreset,
+    previewAudio,
+    notificationTest,
   } from '$lib/ipc';
+  import Icon from '$lib/components/Icon.svelte';
   import SettingsToggle from '$lib/components/settings/SettingsToggle.svelte';
-  import type { CustomAudioInfo } from '$lib/types';
+  import type { AudioPreset, CueKey, CustomAudioInfo } from '$lib/types';
   import * as m from '$paraglide/messages.js';
   import { warn, error as logError } from '@tauri-apps/plugin-log';
 
-  type CueKey = keyof CustomAudioInfo;
+  const isWindows = /Windows/.test(navigator.userAgent);
 
   const CUE_LIST: { id: CueKey; label: () => string }[] = [
     { id: 'work_alert', label: m.notif_alert_work },
     { id: 'short_break_alert', label: m.notif_alert_short_break },
     { id: 'long_break_alert', label: m.notif_alert_long_break },
   ];
+  const BUILT_IN_PRESETS = [
+    ['classic', m.notif_audio_classic],
+    ['soft-bell', m.notif_audio_soft_bell],
+    ['marimba', m.notif_audio_marimba],
+    ['droplet', m.notif_audio_droplet],
+  ] as const;
 
   let localVolume = $state($settings.volume);
+  let savingVolume = $state(false);
   $effect(() => {
-    localVolume = $settings.volume;
+    if (!savingVolume) localVolume = $settings.volume;
   });
 
-  let workAlert = $state<string | null>(null);
-  let shortBreakAlert = $state<string | null>(null);
-  let longBreakAlert = $state<string | null>(null);
+  let audioInfo = $state<CustomAudioInfo | null>(null);
+  let audioBusy = $state(false);
+  let audioLoadFailed = $state(false);
+  let audioErrors = $state<Partial<Record<CueKey, () => string>>>({});
+  let testing = $state(false);
+  let testFeedback = $state('');
+  let testFailed = $state(false);
 
-  function getFileName(id: CueKey): string | null {
-    if (id === 'work_alert') return workAlert;
-    if (id === 'short_break_alert') return shortBreakAlert;
-    return longBreakAlert;
-  }
-
-  function setFileName(id: CueKey, val: string | null) {
-    if (id === 'work_alert') workAlert = val;
-    else if (id === 'short_break_alert') shortBreakAlert = val;
-    else longBreakAlert = val;
-  }
-
-  let workAlertError = $state<string | null>(null);
-  let shortBreakAlertError = $state<string | null>(null);
-  let longBreakAlertError = $state<string | null>(null);
-
-  function getError(id: CueKey): string | null {
-    if (id === 'work_alert') return workAlertError;
-    if (id === 'short_break_alert') return shortBreakAlertError;
-    return longBreakAlertError;
-  }
-
-  function setError(id: CueKey, val: string | null) {
-    if (id === 'work_alert') workAlertError = val;
-    else if (id === 'short_break_alert') shortBreakAlertError = val;
-    else longBreakAlertError = val;
+  async function sendTest() {
+    if (testing || !$settings.notifications_enabled) return;
+    testing = true;
+    testFeedback = '';
+    testFailed = false;
+    try {
+      await notificationTest();
+      testFeedback = isWindows ? m.notif_test_submitted_windows() : m.notif_test_submitted();
+    } catch (e) {
+      testFailed = true;
+      switch (String(e)) {
+        case 'notifications_disabled':
+          testFeedback = m.notif_test_enable_first();
+          break;
+        case 'notifications_windows_unregistered':
+          testFeedback = m.notif_test_windows_unregistered();
+          break;
+        case 'notifications_windows_disabled':
+          testFeedback = m.notif_test_windows_disabled();
+          break;
+        default:
+          testFeedback = m.notif_test_failed();
+      }
+    } finally {
+      testing = false;
+    }
   }
 
   async function refreshAudioInfo() {
+    await pendingAudioChange?.catch(() => {});
     try {
-      const info: CustomAudioInfo = await getCustomAudioInfo();
-      workAlert = info.work_alert;
-      shortBreakAlert = info.short_break_alert;
-      longBreakAlert = info.long_break_alert;
+      audioInfo = await getCustomAudioInfo();
+      audioLoadFailed = false;
     } catch (err) {
-      await warn(`[audio] getCustomAudioInfo failed (audio unavailable?): ${err}`);
+      audioInfo = null;
+      audioLoadFailed = true;
+      void warn(`[audio] getCustomAudioInfo failed: ${err}`).catch(() => {});
     }
   }
 
   onMount(() => {
-    let unlisten: (() => void) | undefined;
-    (async () => {
-      await refreshAudioInfo();
-      unlisten = await onSettingsChanged(refreshAudioInfo);
-    })();
-    return () => unlisten?.();
+    void refreshAudioInfo();
   });
 
   async function toggle(dbKey: string, current: boolean) {
@@ -84,77 +101,184 @@
     settings.set(updated);
   }
 
-  async function handleVolumeInput(e: Event) {
-    const val = (e.target as HTMLInputElement).valueAsNumber;
+  function handleVolumeInput(e: Event & { currentTarget: HTMLInputElement }) {
+    const val = e.currentTarget.valueAsNumber;
     localVolume = val;
-    const updated = await setSetting('volume', String(Math.round(val * 100)));
-    settings.set(updated);
+    savingVolume = true;
+    const revision = ++volumeRevision;
+    pendingVolumeChange = pendingVolumeChange.then(async () => {
+      if (revision !== volumeRevision) return;
+      try {
+        const updated = await setSetting('volume', String(Math.round(val * 100)));
+        if (revision === volumeRevision) settings.set(updated);
+      } catch (err) {
+        void logError(`[audio] setting volume failed: ${err}`).catch(() => {});
+      } finally {
+        if (revision === volumeRevision) savingVolume = false;
+      }
+    });
   }
 
-  async function pickAudio(id: CueKey) {
-    setError(id, null);
-    let path: string | null = null;
+  async function updateAudio(id: CueKey, change: () => Promise<unknown>) {
+    if (audioBusy || !audioInfo) return;
+    audioBusy = true;
+    audioErrors[id] = undefined;
+    pendingAudioChange = Promise.resolve().then(change);
     try {
-      path = await openAudioFilePicker();
+      await pendingAudioChange;
     } catch (err) {
-      await logError(`[audio] file picker error: ${err}`);
-      return;
-    }
-    if (!path) return;
-    try {
-      const displayName = await setCustomAudio(id, path);
-      setFileName(id, displayName);
-      setError(id, null);
-    } catch (err) {
-      await logError(`[audio] setCustomAudio failed: ${err}`);
-      setError(id, String(err));
+      audioErrors[id] = m.notif_audio_save_failed;
+      void logError(`[audio] updating ${id} failed: ${err}`).catch(() => {});
+    } finally {
+      pendingAudioChange = null;
+      await refreshAudioInfo();
+      audioBusy = false;
     }
   }
 
-  async function restoreAudio(id: CueKey) {
+  function selectPreset(id: CueKey, select: HTMLSelectElement) {
+    const current = audioInfo?.presets[id];
+    const selected = select.value as AudioPreset;
+    if (!current || selected === current) return;
+    // Keep the persisted selection until the backend confirms the change.
+    select.value = current;
+    return updateAudio(id, () => setAudioPreset(id, selected));
+  }
+
+  function pickAudio(id: CueKey) {
+    return updateAudio(id, async () => {
+      const path = await openAudioFilePicker();
+      if (path) await setCustomAudio(id, path);
+    });
+  }
+
+  async function playAudio(id: CueKey) {
+    if (audioBusy || !audioInfo || localVolume === 0) return;
+    audioBusy = true;
+    audioErrors[id] = undefined;
     try {
-      await clearCustomAudio(id);
-      setFileName(id, null);
-      setError(id, null);
+      await pendingVolumeChange;
+      await previewAudio(id);
     } catch (err) {
-      await logError(`[audio] clearCustomAudio failed: ${err}`);
+      audioErrors[id] = m.notif_audio_preview_failed;
+      void logError(`[audio] previewing ${id} failed: ${err}`).catch(() => {});
+    } finally {
+      audioBusy = false;
     }
+  }
+
+  function keepAudioControlKeys(event: KeyboardEvent) {
+    event.stopPropagation();
   }
 </script>
 
 <div class="section">
+  <div class="group-heading">{m.notif_group_desktop()}</div>
+  <div class="desktop-row">
+    <div class="desktop-toggle">
+      <SettingsToggle
+        label={m.notif_toggle_desktop()}
+        description={m.notif_toggle_desktop_desc()}
+        checked={$settings.notifications_enabled}
+        onclick={() => {
+          testFeedback = '';
+          return toggle('notifications', $settings.notifications_enabled);
+        }}
+      />
+    </div>
+    <button
+      class="btn-test"
+      onclick={sendTest}
+      disabled={testing || !$settings.notifications_enabled}
+    >
+      {testing ? m.notif_test_sending() : m.notif_test_button()}
+    </button>
+  </div>
+  {#if !$settings.notifications_enabled}<p class="desktop-hint">
+      {m.notif_test_enable_first()}
+    </p>{/if}
+  {#if testFeedback}<p
+      class="desktop-hint"
+      role={testFailed ? 'alert' : 'status'}
+      aria-live="polite"
+    >
+      {testFeedback}
+    </p>{/if}
+  {#if isWindows}<p class="desktop-hint">{m.notif_windows_hint()}</p>{/if}
+
   <div class="group-heading">{m.notif_group_alert()}</div>
 
+  {#if audioLoadFailed}
+    <p class="audio-error" role="alert">{m.notif_audio_load_failed()}</p>
+  {/if}
+  {#if audioInfo && localVolume === 0}
+    <p class="desktop-hint" id="alert-preview-muted">{m.notif_audio_preview_muted()}</p>
+  {/if}
+
   {#each CUE_LIST as { id, label } (id)}
+    {@const filename = audioInfo?.[id]}
     <div class="audio-row">
-      <div class="audio-meta">
-        <span class="label">{label()}</span>
-        <span class="file-name" class:custom={getFileName(id) !== null}>
-          {getFileName(id) ?? m.notif_audio_default()}
-        </span>
-      </div>
+      <label class="label" for={id}>{label()}</label>
       <div class="audio-actions">
-        {#if getFileName(id) !== null}
-          <button class="btn-restore" onclick={() => restoreAudio(id)}
-            >{m.notif_btn_restore()}</button
+        <select
+          {id}
+          value={audioInfo?.presets[id] ?? ''}
+          disabled={!audioInfo}
+          aria-disabled={audioBusy}
+          title={audioInfo?.presets[id] === 'custom' ? filename : undefined}
+          onkeydown={keepAudioControlKeys}
+          onchange={(event) => selectPreset(id, event.currentTarget)}
+        >
+          {#if !audioInfo}<option value=""></option>{/if}
+          {#each BUILT_IN_PRESETS as [preset, presetLabel] (preset)}
+            <option value={preset}>{presetLabel()}</option>
+          {/each}
+          {#if filename}
+            <option value="custom">{m.notif_audio_custom({ name: filename })}</option>
+          {/if}
+        </select>
+        <button
+          type="button"
+          class="audio-icon-button"
+          title={m.notif_audio_preview()}
+          aria-label={m.notif_audio_action({ cue: label(), action: m.notif_audio_preview() })}
+          aria-describedby={audioInfo && localVolume === 0 ? 'alert-preview-muted' : undefined}
+          disabled={!audioInfo}
+          aria-disabled={audioBusy || localVolume === 0}
+          onkeydown={keepAudioControlKeys}
+          onclick={() => playAudio(id)}
+        >
+          <Icon name="play" size={16} />
+        </button>
+        <button
+          type="button"
+          aria-label={m.notif_audio_action({ cue: label(), action: m.notif_btn_choose() })}
+          disabled={!audioInfo}
+          aria-disabled={audioBusy}
+          onkeydown={keepAudioControlKeys}
+          onclick={() => pickAudio(id)}
+        >
+          {m.notif_btn_choose()}
+        </button>
+        {#if filename}
+          <button
+            type="button"
+            class="audio-icon-button"
+            title={m.notif_btn_restore()}
+            aria-label={m.notif_audio_action({ cue: label(), action: m.notif_btn_restore() })}
+            aria-disabled={audioBusy}
+            onkeydown={keepAudioControlKeys}
+            onclick={() => updateAudio(id, () => clearCustomAudio(id))}
           >
+            <Icon name="reset" size={16} />
+          </button>
         {/if}
-        <button class="btn-choose" onclick={() => pickAudio(id)}>{m.notif_btn_choose()}</button>
       </div>
     </div>
-    {#if getError(id)}
-      <p class="audio-error">{getError(id)}</p>
+    {#if audioErrors[id]}
+      <p class="audio-error" role="alert">{audioErrors[id]?.()}</p>
     {/if}
   {/each}
-
-  <div class="group-heading">{m.notif_group_desktop()}</div>
-
-  <SettingsToggle
-    label={m.notif_toggle_desktop()}
-    description={m.notif_toggle_desktop_desc()}
-    checked={$settings.notifications_enabled}
-    onclick={() => toggle('notifications', $settings.notifications_enabled)}
-  />
 
   <div class="group-heading">{m.notif_group_tick()}</div>
 
@@ -194,6 +318,41 @@
 </div>
 
 <style>
+  .desktop-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding-right: 20px;
+  }
+  .desktop-toggle {
+    flex: 1;
+    min-width: 0;
+  }
+  .desktop-hint {
+    padding: 4px 20px 8px;
+    font-size: 0.73rem;
+    line-height: 1.5;
+    color: var(--color-foreground-darker);
+  }
+  .btn-test {
+    flex-shrink: 0;
+    border: 1px solid var(--color-separator);
+    border-radius: 4px;
+    padding: 6px 10px;
+    background: var(--color-hover);
+    color: var(--color-foreground);
+    font: inherit;
+    font-size: 0.72rem;
+    cursor: pointer;
+  }
+  .btn-test:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .btn-test:focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+  }
   .section {
     display: flex;
     flex-direction: column;
@@ -288,71 +447,73 @@
 
   .audio-row {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     justify-content: space-between;
-    gap: 12px;
+    gap: 8px 12px;
     padding: 10px 20px;
     border-bottom: 1px solid var(--color-separator);
   }
 
-  .audio-meta {
-    display: flex;
-    flex-direction: column;
-    gap: 3px;
-    min-width: 0;
-  }
-
-  .file-name {
-    font-size: 0.72rem;
-    font-family: monospace;
-    color: var(--color-foreground-darker, rgba(255, 255, 255, 0.35));
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    max-width: 180px;
-  }
-
-  .file-name.custom {
-    color: var(--color-accent);
-  }
-
   .audio-actions {
     display: flex;
+    align-items: center;
     gap: 6px;
-    flex-shrink: 0;
+    min-width: 0;
+    max-width: 100%;
   }
 
-  .btn-choose,
-  .btn-restore {
-    font-size: 0.72rem;
+  .audio-actions select,
+  .audio-actions button {
+    min-height: 36px;
     padding: 4px 10px;
-    border-radius: 4px;
+    border-radius: var(--radius-control);
     cursor: pointer;
-    border: 1px solid color-mix(in oklch, var(--color-foreground) 20%, transparent);
+    border: 1px solid var(--control-border);
     background: var(--color-hover);
     color: var(--color-foreground);
-    transition: background 0.15s;
-    white-space: nowrap;
+    font: inherit;
+    font-size: 0.8rem;
   }
 
-  .btn-choose:hover {
+  .audio-actions select {
+    width: 142px;
+    min-width: 84px;
+    text-overflow: ellipsis;
+    background: var(--color-background-light);
+  }
+
+  .audio-actions select option {
+    background: var(--color-background-light);
+    color: var(--color-foreground);
+  }
+
+  .audio-actions .audio-icon-button {
+    display: grid;
+    place-items: center;
+    width: 36px;
+    flex-shrink: 0;
+    padding: 0;
+  }
+
+  .audio-actions button:not(:disabled, [aria-disabled='true']):hover {
     background: color-mix(in oklch, var(--color-foreground) 17%, transparent);
   }
 
-  .btn-restore {
-    color: var(--color-foreground-darker, rgba(255, 255, 255, 0.5));
+  .audio-actions :is(select, button):focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
   }
 
-  .btn-restore:hover {
-    background: color-mix(in oklch, var(--color-foreground) 14%, transparent);
-    color: var(--color-foreground);
+  .audio-actions :is(:disabled, [aria-disabled='true']) {
+    opacity: 0.5;
+    cursor: default;
   }
 
   .audio-error {
     margin: 0;
     padding: 2px 20px 8px;
-    font-size: 0.72rem;
-    color: var(--color-danger, #e05252);
-    font-family: monospace;
+    font-size: 0.75rem;
+    color: var(--color-error);
   }
 </style>

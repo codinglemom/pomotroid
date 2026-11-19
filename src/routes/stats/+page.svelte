@@ -1,13 +1,14 @@
 <script lang="ts">
   import '../../app.css';
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import {
     getSettings,
     getThemes,
-    onSettingsChanged,
+    watchWindowSettings,
     onThemesChanged,
     onRoundChange,
     onSessionsCleared,
+    onWalletError,
     statsGetDetailed,
     statsGetHeatmap,
   } from '$lib/ipc';
@@ -25,13 +26,18 @@
   import DailyView from '$lib/components/stats/DailyView.svelte';
   import WeeklyView from '$lib/components/stats/WeeklyView.svelte';
   import YearlyView from '$lib/components/stats/YearlyView.svelte';
+  import RewardWallet from '$lib/components/stats/RewardWallet.svelte';
+  import Icon from '$lib/components/Icon.svelte';
+  import { WINDOW_NAVIGATE } from '$lib/utils/windows';
 
-  type Tab = 'today' | 'week' | 'alltime';
+  type Tab = 'today' | 'week' | 'alltime' | 'wallet';
 
   let activeTab = $state<Tab>('today');
   let detailed = $state<DetailedStats | null>(null);
   let heatmap = $state<HeatmapStats | null>(null);
   let heatmapLoaded = $state(false);
+  let walletFailure = $state(false);
+  let statsYear = $state(new Date().getFullYear());
 
   async function switchTab(tab: Tab) {
     activeTab = tab;
@@ -51,30 +57,66 @@
 
   onMount(() => {
     const cleanups: UnlistenFn[] = [];
+    let disposed = false;
+    if (new URLSearchParams(window.location.search).get('tab') === 'wallet') activeTab = 'wallet';
 
     (async () => {
+      const unlisten = await getCurrentWebviewWindow().listen<string>(
+        WINDOW_NAVIGATE,
+        ({ payload }) => {
+          if (payload === 'wallet') void switchTab('wallet');
+        }
+      );
+      if (disposed) {
+        unlisten();
+        return;
+      }
+      cleanups.push(unlisten);
       try {
-        const s = await getSettings();
+        const [s, themes, initialDetailed] = await Promise.all([
+          getSettings(),
+          getThemes(),
+          statsGetDetailed().catch((e) => {
+            void logError(`[stats] failed to load initial stats: ${e}`).catch(() => {});
+            return null;
+          }),
+        ]);
+        detailed = initialDetailed;
         settings.set(s);
         setLocale(s.language);
-        await info(`[stats] settings loaded, locale=${s.language}`);
+        void info(`[stats] settings loaded, locale=${s.language}`).catch(() => {});
 
-        const themes = await getThemes();
         const osDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
         const activeTheme = themes.find((t) => t.name === resolveThemeName(s, osDark)) ?? themes[0];
-        if (activeTheme) applyTheme(activeTheme);
+        if (activeTheme) await applyTheme(activeTheme);
 
-        // Show window immediately after theme is applied
+        // Present the populated first view with its final theme and local fonts.
+        await tick();
+        await document.fonts.ready;
         await getCurrentWebviewWindow().show();
+        await getCurrentWebviewWindow().setFocus();
 
-        detailed = await statsGetDetailed();
-        await info(`[stats] initialized, theme=${activeTheme?.name ?? 'none'}`);
+        void info(`[stats] initialized, theme=${activeTheme?.name ?? 'none'}`).catch(() => {});
       } catch (e) {
         await logError(`[stats] initialization failed: ${e}`);
         throw e;
       }
 
+      // Refresh date-sensitive views whenever the window regains focus.
       cleanups.push(
+        await getCurrentWebviewWindow().onFocusChanged(async ({ payload: focused }) => {
+          if (!focused) return;
+          statsYear = new Date().getFullYear();
+          try {
+            detailed = await statsGetDetailed();
+            if (heatmapLoaded) heatmap = await statsGetHeatmap();
+          } catch (e) {
+            await logError(`[stats] failed to refresh stats on focus: ${e}`);
+          }
+        }),
+        await onWalletError(() => {
+          walletFailure = true;
+        }),
         await onRoundChange(async () => {
           try {
             detailed = await statsGetDetailed();
@@ -91,7 +133,7 @@
             await logError(`[stats] failed to refresh stats after session clear: ${e}`);
           }
         }),
-        await onSettingsChanged(async (updated) => {
+        await watchWindowSettings(async (updated) => {
           const prev = {
             mode: $settings.theme_mode,
             light: $settings.theme_light,
@@ -120,9 +162,20 @@
           if (current) applyTheme(current);
         })
       );
+
+      const mq = window.matchMedia('(prefers-color-scheme: dark)');
+      const mqListener = async (e: MediaQueryListEvent) => {
+        if ($settings.theme_mode !== 'auto') return;
+        const allThemes = await getThemes();
+        const t = allThemes.find((th) => th.name === resolveThemeName($settings, e.matches));
+        if (t) applyTheme(t);
+      };
+      mq.addEventListener('change', mqListener);
+      cleanups.push(() => mq.removeEventListener('change', mqListener));
     })();
 
     return () => {
+      disposed = true;
       for (const fn of cleanups) fn();
     };
   });
@@ -131,9 +184,9 @@
 <div class="window">
   <!-- Titlebar -->
   <nav class="titlebar" class:macos={isMac} data-tauri-drag-region>
-    <span class="titlebar-label">{m.stats_title()}</span>
+    <span class="titlebar-label">小番茄 · {m.stats_title()}</span>
     {#if !isMac}
-      <button class="btn-close" onclick={close} aria-label="Close">
+      <button class="btn-close" onclick={close} aria-label={m.ui_close()}>
         <svg width="12" height="12" viewBox="0 0 12 12">
           <line
             x1="1"
@@ -159,17 +212,36 @@
   </nav>
 
   <!-- Tab bar -->
-  <div class="tabs">
-    <button class="tab" class:active={activeTab === 'today'} onclick={() => switchTab('today')}
-      >{m.stats_tab_today()}</button
+  <nav class="tabs" aria-label={m.stats_title()}>
+    <button
+      class="tab"
+      class:active={activeTab === 'today'}
+      aria-current={activeTab === 'today' ? 'page' : undefined}
+      onclick={() => switchTab('today')}>{m.stats_tab_today()}</button
     >
-    <button class="tab" class:active={activeTab === 'week'} onclick={() => switchTab('week')}
-      >{m.stats_tab_week()}</button
+    <button
+      class="tab"
+      class:active={activeTab === 'week'}
+      aria-current={activeTab === 'week' ? 'page' : undefined}
+      onclick={() => switchTab('week')}>{m.stats_tab_week()}</button
     >
-    <button class="tab" class:active={activeTab === 'alltime'} onclick={() => switchTab('alltime')}
-      >{m.stats_tab_alltime()}</button
+    <button
+      class="tab"
+      class:active={activeTab === 'alltime'}
+      aria-current={activeTab === 'alltime' ? 'page' : undefined}
+      onclick={() => switchTab('alltime')}>{m.stats_tab_alltime()}</button
     >
-  </div>
+    <button
+      class="tab wallet-tab"
+      class:active={activeTab === 'wallet'}
+      aria-current={activeTab === 'wallet' ? 'page' : undefined}
+      onclick={() => switchTab('wallet')}><Icon name="coin" size={16} />{m.wallet_title()}</button
+    >
+  </nav>
+
+  {#if walletFailure}
+    <p class="wallet-error" role="alert">{m.wallet_recording_failed()}</p>
+  {/if}
 
   <!-- Content -->
   <div class="content">
@@ -177,8 +249,12 @@
       <DailyView today={detailed?.today ?? null} />
     {:else if activeTab === 'week'}
       <WeeklyView week={detailed?.week ?? null} streak={detailed?.streak ?? null} />
+    {:else if activeTab === 'alltime'}
+      {#key statsYear}
+        <YearlyView {heatmap} />
+      {/key}
     {:else}
-      <YearlyView {heatmap} />
+      <RewardWallet />
     {/if}
   </div>
 </div>
@@ -188,100 +264,92 @@
     display: flex;
     flex-direction: column;
     height: 100vh;
-    background: var(--color-background);
+    background: transparent;
     color: var(--color-foreground);
-    animation: app-fade-in 0.18s ease;
     overflow: hidden;
-    cursor: default;
   }
-
-  /* ── Titlebar ──────────────────────────────────────────── */
   .titlebar {
     height: 40px;
     display: flex;
     align-items: center;
-    justify-content: center;
     position: relative;
     flex-shrink: 0;
     border-bottom: 1px solid var(--color-separator);
+    padding: 0 16px;
+    background: var(--surface-sidebar);
   }
-
-  .macos {
-    padding-left: 72px;
+  .titlebar.macos {
+    padding-left: 76px;
   }
-
   .titlebar-label {
-    font-size: 0.75rem;
-    font-weight: 600;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
+    font-size: 12px;
+    font-weight: 500;
     color: var(--color-foreground-darker);
     pointer-events: none;
   }
-
   .btn-close {
     position: absolute;
     right: 8px;
-    background: none;
-    border: none;
+    border: 0;
+    background: transparent;
     cursor: pointer;
     color: var(--color-foreground-darker);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    border-radius: 4px;
-    transition:
-      color 0.15s,
-      background 0.15s;
+    display: grid;
+    place-items: center;
+    width: 32px;
+    height: 32px;
+    border-radius: 6px;
   }
-
   .btn-close:hover {
-    color: var(--color-background);
-    background: var(--color-focus-round);
+    background: var(--color-error);
+    color: white;
   }
-
-  /* ── Tabs ──────────────────────────────────────────────── */
   .tabs {
     display: flex;
-    gap: 0;
+    align-items: center;
+    gap: 4px;
+    padding: 10px 24px;
+    min-height: 56px;
     border-bottom: 1px solid var(--color-separator);
     flex-shrink: 0;
-    padding: 0 24px;
   }
-
   .tab {
-    background: none;
-    border: none;
-    border-bottom: 2px solid transparent;
-    margin-bottom: -1px;
-    padding: 10px 20px;
-    font-size: 0.78rem;
-    font-weight: 600;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
+    border: 0;
+    border-radius: 6px;
+    padding: 6px 14px;
+    min-height: 32px;
+    font-size: 12px;
     color: var(--color-foreground-darker);
+    background: transparent;
     cursor: pointer;
-    transition:
-      color 0.15s,
-      border-color 0.15s;
   }
-
   .tab:hover {
     color: var(--color-foreground);
+    background: var(--color-hover);
   }
-
+  .wallet-tab {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
   .tab.active {
-    color: var(--color-focus-round);
-    border-bottom-color: var(--color-focus-round);
+    color: var(--color-foreground);
+    background: var(--surface-panel);
+    font-weight: 600;
+    box-shadow: 0 1px 3px rgb(0 0 0 / 7%);
   }
-
-  /* ── Content ───────────────────────────────────────────── */
   .content {
     flex: 1;
+    min-height: 0;
     overflow: hidden;
     display: flex;
     flex-direction: column;
+  }
+  .wallet-error {
+    padding: 8px 24px;
+    color: var(--color-error);
+    background: var(--surface-panel);
+    font-size: 12px;
+    flex-shrink: 0;
   }
 </style>

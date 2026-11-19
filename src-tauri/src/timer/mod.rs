@@ -8,7 +8,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::audio::{AudioCue, AudioManager};
-use crate::db::{queries, DbState};
+use crate::db::{queries, wallet, DbState};
 use crate::settings::Settings;
 use crate::tray::{self, TrayState};
 use crate::websocket::{self, WsState};
@@ -31,7 +31,7 @@ pub struct TimerSnapshot {
     pub elapsed_secs: u32,
     pub total_secs: u32,
     pub is_running: bool,
-    /// True if the timer has been started and then paused (elapsed > 0, not running).
+    /// True if the timer was paused or suspended, including before the first tick.
     pub is_paused: bool,
     pub work_round_number: u32,
     pub work_rounds_total: u32,
@@ -44,9 +44,51 @@ pub struct TimerSnapshot {
 // Shared mutable state between the controller and the event-listener thread
 // ---------------------------------------------------------------------------
 
+#[derive(PartialEq, Eq)]
+enum TimerPhase {
+    Idle,
+    Running,
+    Paused,
+}
+
+impl TimerPhase {
+    fn toggle_command(&self) -> TimerCommand {
+        match self {
+            Self::Running => {
+                log::info!("[timer] pause");
+                TimerCommand::Pause
+            }
+            Self::Paused => {
+                log::info!("[timer] resume");
+                TimerCommand::Resume
+            }
+            Self::Idle => {
+                log::info!("[timer] start");
+                TimerCommand::Start
+            }
+        }
+    }
+}
+
 struct TimerShared {
     elapsed_secs: u32,
-    is_running: bool,
+    // The active engine duration can differ from newly edited preferences.
+    total_secs: u32,
+    phase: TimerPhase,
+    active_session_id: Option<i64>,
+}
+
+impl TimerShared {
+    fn pause(&mut self, elapsed_secs: u32) {
+        self.elapsed_secs = elapsed_secs;
+        self.phase = TimerPhase::Paused;
+    }
+
+    fn set_idle(&mut self, total_secs: u32) {
+        self.elapsed_secs = 0;
+        self.total_secs = total_secs;
+        self.phase = TimerPhase::Idle;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -81,7 +123,9 @@ impl TimerController {
         let settings_arc = Arc::new(Mutex::new(settings));
         let shared = Arc::new(Mutex::new(TimerShared {
             elapsed_secs: 0,
-            is_running: false,
+            total_secs: duration,
+            phase: TimerPhase::Idle,
+            active_session_id: None,
         }));
 
         // Clone handles for the event-listener thread.
@@ -123,16 +167,11 @@ impl TimerController {
     /// Toggle: start a fresh timer if idle, resume if paused, pause if running.
     pub fn toggle(&self) {
         let s = self.shared.lock().unwrap();
-        if s.is_running {
-            log::info!("[timer] pause");
-            self.engine.send(TimerCommand::Pause);
-        } else if s.elapsed_secs > 0 {
-            log::info!("[timer] resume");
-            self.engine.send(TimerCommand::Resume);
-        } else {
-            log::info!("[timer] start");
-            self.engine.send(TimerCommand::Start);
-        }
+        self.send_command(s.phase.toggle_command());
+    }
+
+    pub(crate) fn send_command(&self, command: TimerCommand) {
+        self.engine.send(command);
     }
 
     pub fn reset(&self) {
@@ -178,27 +217,17 @@ impl TimerController {
 
     // --- Query ---
 
-    pub fn get_snapshot(&self) -> TimerSnapshot {
-        let seq = self.sequence.lock().unwrap();
-        let settings = self.settings.lock().unwrap();
-        let shared = self.shared.lock().unwrap();
-
-        TimerSnapshot {
-            round_type: seq.current_round.as_str().to_string(),
-            previous_round_type: seq.previous_round.map(|r| r.as_str().to_string()).unwrap_or_default(),
-            elapsed_secs: shared.elapsed_secs,
-            total_secs: seq.current_duration_secs(&settings),
-            is_running: shared.is_running,
-            is_paused: !shared.is_running && shared.elapsed_secs > 0,
-            work_round_number: seq.work_round_number,
-            work_rounds_total: seq.work_rounds_total,
-            session_work_count: seq.session_work_count,
-        }
+    /// Read while holding the database lock when clearing session history.
+    pub fn active_session_id(&self) -> Option<i64> {
+        self.shared.lock().unwrap().active_session_id
     }
 
-    /// Apply new settings values. Updates the in-memory copy and, if the
-    /// timer is idle (not running and no elapsed progress), reconfigures the
-    /// engine so the next Start uses the new duration.
+    pub fn get_snapshot(&self) -> TimerSnapshot {
+        build_snapshot(&self.sequence, &self.shared)
+    }
+
+    /// Apply new settings values. Updates the in-memory copy and reconfigures
+    /// an idle engine so the next Start uses the new duration.
     ///
     /// When the timer is running or paused, the current countdown is left
     /// untouched; the new duration takes effect at the start of the next
@@ -209,8 +238,16 @@ impl TimerController {
         // reflect the new long_break_interval immediately.
         self.sequence.lock().unwrap().work_rounds_total = new.long_break_interval;
         *self.settings.lock().unwrap() = new;
-        let s = self.shared.lock().unwrap();
-        let is_idle = !s.is_running && s.elapsed_secs == 0;
+        let duration = {
+            let seq = self.sequence.lock().unwrap();
+            let settings = self.settings.lock().unwrap();
+            seq.current_duration_secs(&settings)
+        };
+        let mut s = self.shared.lock().unwrap();
+        let is_idle = s.phase == TimerPhase::Idle;
+        if is_idle {
+            s.total_secs = duration;
+        }
         drop(s);
         if is_idle {
             self.reconfigure();
@@ -241,12 +278,33 @@ fn listen_events(
     let mut last_tray_progress: f32 = -1.0;
     // Active session row ID for recording (None = not started yet).
     let mut current_session_id: Option<i64> = None;
+    let mut current_reward_rate: Option<i64> = None;
 
     while let Ok(event) = event_rx.recv() {
         match event {
             TimerEvent::Started { total_secs } => {
                 log::info!("[timer] started total={total_secs}s");
-                shared.lock().unwrap().is_running = true;
+                // Read once at Started. Pausing/resuming never changes this snapshot.
+                current_reward_rate = match db.lock() {
+                    Ok(conn) => match wallet::get_rate(&conn) {
+                        Ok(rate) => rate,
+                        Err(e) => {
+                            log::error!("[wallet] failed to capture round rate; this round will not earn a reward: {e}");
+                            let _ = app.emit("wallet:error", ());
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        log::error!("[wallet] failed to lock database for rate snapshot: {e}");
+                        let _ = app.emit("wallet:error", ());
+                        None
+                    }
+                };
+                {
+                    let mut state = shared.lock().unwrap();
+                    state.phase = TimerPhase::Running;
+                    state.total_secs = total_secs;
+                }
                 let _ = app.emit("timer:started", serde_json::json!({ "total_secs": total_secs }));
                 if let Some(ws) = app.try_state::<Arc<WsState>>() {
                     websocket::broadcast_started(&ws, total_secs);
@@ -258,7 +316,8 @@ fn listen_events(
                 {
                     let mut s = shared.lock().unwrap();
                     s.elapsed_secs = elapsed_secs;
-                    s.is_running = true;
+                    s.total_secs = total_secs;
+                    s.phase = TimerPhase::Running;
                 }
                 let _ = app.emit(
                     "timer:tick",
@@ -268,15 +327,22 @@ fn listen_events(
                 // --- Session recording: start on first tick of a new round ---
                 if elapsed_secs == 1 && current_session_id.is_none() {
                     let rt = sequence.lock().unwrap().current_round.as_str().to_string();
-                    let total = {
-                        let seq = sequence.lock().unwrap();
-                        let s = settings.lock().unwrap();
-                        seq.current_duration_secs(&s)
-                    };
-                    if let Ok(conn) = db.lock() {
-                        match queries::insert_session(&conn, &rt, total) {
-                            Ok(id) => current_session_id = Some(id),
-                            Err(e) => log::error!("[timer] failed to record session: {e}"),
+                    match db.lock() {
+                        Ok(conn) => match queries::insert_session_with_reward_rate(
+                            &conn, &rt, total_secs, current_reward_rate,
+                        ) {
+                            Ok(id) => {
+                                current_session_id = Some(id);
+                                shared.lock().unwrap().active_session_id = Some(id);
+                            }
+                            Err(e) => {
+                                log::error!("[timer] failed to record session; no reward can be credited: {e}");
+                                let _ = app.emit("wallet:error", ());
+                            }
+                        },
+                        Err(e) => {
+                            log::error!("[timer] failed to lock database to record session: {e}");
+                            let _ = app.emit("wallet:error", ());
                         }
                     }
                 }
@@ -309,10 +375,26 @@ fn listen_events(
 
                 // --- Session recording: mark the completed round ---
                 if let Some(session_id) = current_session_id.take() {
-                    if let Ok(conn) = db.lock() {
-                        let _ = queries::complete_session(&conn, session_id, !was_skipped);
+                    match db.lock() {
+                        Ok(conn) => match queries::complete_session(&conn, session_id, !was_skipped) {
+                            Ok(true) => {
+                                log::info!("[wallet] reward committed for session={session_id}");
+                                let _ = app.emit("wallet:changed", ());
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                log::error!("[wallet] failed to finalize session={session_id}; completion and reward were rolled back: {e}");
+                                let _ = app.emit("wallet:error", ());
+                            }
+                        },
+                        Err(e) => {
+                            log::error!("[wallet] failed to lock database to finalize session={session_id}: {e}");
+                            let _ = app.emit("wallet:error", ());
+                        }
                     }
                 }
+                current_reward_rate = None;
+                shared.lock().unwrap().active_session_id = None;
 
                 // Advance sequence.
                 let (next_round, next_duration, auto_start_work, auto_start_break) = {
@@ -323,11 +405,7 @@ fn listen_events(
                 };
 
                 // Reset shared state for the new round.
-                {
-                    let mut s = shared.lock().unwrap();
-                    s.elapsed_secs = 0;
-                    s.is_running = false;
-                }
+                shared.lock().unwrap().set_idle(next_duration);
 
                 // Arm the next round's duration without risking a late
                 // reconfigure that kicks a freshly-started timer back to Idle.
@@ -336,12 +414,15 @@ fn listen_events(
                 });
 
                 // Emit round-change with the new snapshot.
-                let snapshot = build_snapshot(&sequence, &settings, &shared);
+                let snapshot = build_snapshot(&sequence, &shared);
                 let _ = app.emit("timer:round-change", snapshot);
 
-                // Desktop notifications are dispatched by the frontend via the
-                // notification_show command after receiving the timer:round-change
-                // event, so translated strings can be used.
+                // Notify once from Rust even when all WebViews are destroyed.
+                // Manual skips also notify, matching the previous UI behavior.
+                let notification_settings = settings.lock().unwrap().clone();
+                crate::notifications::show_round_change(
+                    &app, &notification_settings, next_round.as_str(), &completed_round,
+                );
 
                 // Audio alert for the new round.
                 if let Some(audio) = app.try_state::<Arc<AudioManager>>() {
@@ -378,7 +459,7 @@ fn listen_events(
 
                 // Broadcast round-change to any connected WebSocket clients.
                 if let Some(ws) = app.try_state::<Arc<WsState>>() {
-                    let snap = build_snapshot(&sequence, &settings, &shared);
+                    let snap = build_snapshot(&sequence, &shared);
                     websocket::broadcast_round_change(&ws, snap);
                 }
 
@@ -400,7 +481,7 @@ fn listen_events(
 
             TimerEvent::Paused { elapsed_secs } => {
                 log::info!("[timer] paused elapsed={elapsed_secs}s");
-                shared.lock().unwrap().is_running = false;
+                shared.lock().unwrap().pause(elapsed_secs);
                 let _ = app.emit("timer:paused", serde_json::json!({ "elapsed_secs": elapsed_secs }));
                 if let Some(ws) = app.try_state::<Arc<WsState>>() {
                     websocket::broadcast_paused(&ws, elapsed_secs);
@@ -408,11 +489,7 @@ fn listen_events(
 
                 // Show pause bars in tray.
                 let rt = sequence.lock().unwrap().current_round.as_str().to_string();
-                let total = {
-                    let seq = sequence.lock().unwrap();
-                    let s = settings.lock().unwrap();
-                    seq.current_duration_secs(&s)
-                };
+                let total = shared.lock().unwrap().total_secs;
                 let progress = if total > 0 { elapsed_secs as f32 / total as f32 } else { 0.0 };
                 tray::update_icon(&tray, &rt, true, progress);
                 tray::update_menu_items(&tray, false, true);
@@ -420,7 +497,7 @@ fn listen_events(
 
             TimerEvent::Resumed { elapsed_secs } => {
                 log::info!("[timer] resumed elapsed={elapsed_secs}s");
-                shared.lock().unwrap().is_running = true;
+                shared.lock().unwrap().phase = TimerPhase::Running;
                 let _ = app.emit("timer:resumed", serde_json::json!({ "elapsed_secs": elapsed_secs }));
                 if let Some(ws) = app.try_state::<Arc<WsState>>() {
                     websocket::broadcast_resumed(&ws, elapsed_secs);
@@ -428,11 +505,7 @@ fn listen_events(
 
                 // Restore arc in tray.
                 let rt = sequence.lock().unwrap().current_round.as_str().to_string();
-                let total = {
-                    let seq = sequence.lock().unwrap();
-                    let s = settings.lock().unwrap();
-                    seq.current_duration_secs(&s)
-                };
+                let total = shared.lock().unwrap().total_secs;
                 let progress = if total > 0 { elapsed_secs as f32 / total as f32 } else { 0.0 };
                 tray::update_icon(&tray, &rt, false, progress);
                 last_tray_progress = progress;
@@ -443,13 +516,20 @@ fn listen_events(
                 log::debug!("[timer] idle");
                 // Abandon the active session (leave DB row as-is).
                 current_session_id = None;
+                current_reward_rate = None;
+
+                let duration = {
+                    let seq = sequence.lock().unwrap();
+                    let settings = settings.lock().unwrap();
+                    seq.current_duration_secs(&settings)
+                };
 
                 {
                     let mut s = shared.lock().unwrap();
-                    s.elapsed_secs = 0;
-                    s.is_running = false;
+                    s.set_idle(duration);
+                    s.active_session_id = None;
                 }
-                let snapshot = build_snapshot(&sequence, &settings, &shared);
+                let snapshot = build_snapshot(&sequence, &shared);
                 let _ = app.emit("timer:reset", snapshot);
                 if let Some(ws) = app.try_state::<Arc<WsState>>() {
                     websocket::broadcast_reset(&ws);
@@ -460,11 +540,6 @@ fn listen_events(
                 // total. Using the lighter-weight command here avoids a race
                 // where a fast user click on Start is immediately clobbered by
                 // a late follow-up duration update.
-                let duration = {
-                    let seq = sequence.lock().unwrap();
-                    let s = settings.lock().unwrap();
-                    seq.current_duration_secs(&s)
-                };
                 engine.send(TimerCommand::Prime { duration_secs: duration });
 
                 // Reset tray to idle (empty arc).
@@ -476,7 +551,7 @@ fn listen_events(
 
             TimerEvent::Suspended { elapsed_secs } => {
                 log::info!("[timer] suspended by system elapsed={elapsed_secs}s");
-                shared.lock().unwrap().is_running = false;
+                shared.lock().unwrap().pause(elapsed_secs);
                 let _ = app.emit(
                     "timer:suspended",
                     serde_json::json!({ "elapsed_secs": elapsed_secs }),
@@ -484,11 +559,7 @@ fn listen_events(
 
                 // Show pause bars while suspended.
                 let rt = sequence.lock().unwrap().current_round.as_str().to_string();
-                let total = {
-                    let seq = sequence.lock().unwrap();
-                    let s = settings.lock().unwrap();
-                    seq.current_duration_secs(&s)
-                };
+                let total = shared.lock().unwrap().total_secs;
                 let progress = if total > 0 { elapsed_secs as f32 / total as f32 } else { 0.0 };
                 tray::update_icon(&tray, &rt, true, progress);
             }
@@ -498,22 +569,74 @@ fn listen_events(
 
 fn build_snapshot(
     sequence: &Arc<Mutex<SequenceState>>,
-    settings: &Arc<Mutex<Settings>>,
     shared: &Arc<Mutex<TimerShared>>,
 ) -> TimerSnapshot {
     let seq = sequence.lock().unwrap();
-    let s = settings.lock().unwrap();
     let sh = shared.lock().unwrap();
 
     TimerSnapshot {
         round_type: seq.current_round.as_str().to_string(),
         previous_round_type: seq.previous_round.map(|r| r.as_str().to_string()).unwrap_or_default(),
         elapsed_secs: sh.elapsed_secs,
-        total_secs: seq.current_duration_secs(&s),
-        is_running: sh.is_running,
-        is_paused: !sh.is_running && sh.elapsed_secs > 0,
+        total_secs: sh.total_secs,
+        is_running: sh.phase == TimerPhase::Running,
+        is_paused: sh.phase == TimerPhase::Paused,
         work_round_number: seq.work_round_number,
         work_rounds_total: seq.work_rounds_total,
         session_work_count: seq.session_work_count,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_elapsed_pause_can_resume_and_reset() {
+        let sequence = Arc::new(Mutex::new(SequenceState::new(4)));
+        let duration = 1500;
+        let (engine, events) = engine::spawn(duration, Duration::from_secs(60));
+        let shared = Arc::new(Mutex::new(TimerShared {
+            elapsed_secs: 0,
+            total_secs: duration,
+            phase: TimerPhase::Idle,
+            active_session_id: None,
+        }));
+        let toggle = || engine.send(shared.lock().unwrap().phase.toggle_command());
+        let next_event = || events.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        toggle();
+        assert!(matches!(next_event(), TimerEvent::Started { .. }));
+        shared.lock().unwrap().phase = TimerPhase::Running;
+
+        toggle();
+        let TimerEvent::Paused { elapsed_secs } = next_event() else {
+            panic!("expected a pause event");
+        };
+        shared.lock().unwrap().pause(elapsed_secs);
+        let paused = build_snapshot(&sequence, &shared);
+        assert_eq!(paused.elapsed_secs, 0);
+        assert!(paused.is_paused);
+        assert!(!paused.is_running);
+
+        toggle();
+        assert!(matches!(next_event(), TimerEvent::Resumed { elapsed_secs: 0 }));
+        shared.lock().unwrap().phase = TimerPhase::Running;
+
+        toggle();
+        let TimerEvent::Paused { elapsed_secs } = next_event() else {
+            panic!("expected a pause event");
+        };
+        shared.lock().unwrap().pause(elapsed_secs);
+
+        engine.send(TimerCommand::Reset);
+        assert!(matches!(next_event(), TimerEvent::Reset));
+        shared.lock().unwrap().set_idle(duration);
+        let reset = build_snapshot(&sequence, &shared);
+        assert_eq!(reset.elapsed_secs, 0);
+        assert!(!reset.is_paused);
+        assert!(!reset.is_running);
+        toggle();
+        assert!(matches!(next_event(), TimerEvent::Started { .. }));
     }
 }

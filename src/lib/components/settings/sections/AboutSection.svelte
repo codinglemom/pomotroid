@@ -3,6 +3,7 @@
   import { openUrl } from '@tauri-apps/plugin-opener';
 
   import { info, warn, error as logError } from '@tauri-apps/plugin-log';
+  import TomatoMark from '$lib/components/TomatoMark.svelte';
   import { openLogDir, appVersion, checkUpdate, installUpdate } from '$lib/ipc';
   import { settings } from '$lib/stores/settings';
   import type { UpdateInfo } from '$lib/types';
@@ -70,28 +71,9 @@
 
 <div class="section">
   <div class="hero">
-    <svg
-      version="1.2"
-      baseProfile="tiny"
-      width="64"
-      height="64"
-      viewBox="0 0 256 256"
-      xmlns="http://www.w3.org/2000/svg"
-      aria-label="Pomotroid logo"
-    >
-      <circle fill="var(--color-background-light)" cx="128" cy="128" r="126.81" />
-      <circle
-        fill="none"
-        stroke="var(--color-focus-round)"
-        stroke-width="40"
-        stroke-linecap="round"
-        cx="128"
-        cy="128"
-        r="73.31"
-      />
-    </svg>
+    <TomatoMark size={64} />
     <div>
-      <h2 class="name">Pomotroid</h2>
+      <h2 class="name">小番茄</h2>
       <p class="version">Version {version}</p>
     </div>
   </div>
@@ -161,7 +143,7 @@
   {/if}
 
   <p class="credit">
-    Built with Tauri, Svelte, and Rust.<br />
+    Based on Pomotroid. Built with Tauri, Svelte, and Rust.<br />
     MIT License — Copyright &copy; 2017–2026 Christopher Murphy.
   </p>
 </div>

@@ -1,27 +1,26 @@
 /// Rust audio playback via rodio.
 ///
-/// All four audio assets are embedded at compile time so they are available
+/// Built-in audio assets are embedded at compile time so they are available
 /// even when the app is hidden to the system tray.
 ///
 /// Architecture:
-///   A dedicated OS thread owns the `OutputStream` (not `Send` on macOS).
-///   `AudioManager` communicates with that thread via a `SyncSender`.
+///   A dedicated OS thread plays timer sounds received via a `SyncSender`.
+///   Previews open their own output stream on a blocking worker.
 ///   Tauri manages `Arc<AudioManager>` as state; it is `Send + Sync`.
 ///
 /// Custom audio:
-///   Per-cue custom files are stored in `{app_data_dir}/audio/` with fixed
-///   stems (`custom_work_alert`, `custom_short_break_alert`,
-///   `custom_long_break_alert`). The audio thread tries the custom file first
-///   and falls back to the embedded bytes if the file is missing or unreadable.
+///   Per-cue custom files are stored in `{app_data_dir}/audio/`. The audio
+///   thread falls back to the classic sound if the custom file cannot play.
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use rodio::{Decoder, DeviceSinkBuilder, Player};
+use rodio::{Decoder, DeviceSinkBuilder, Player, Source};
+use rusqlite::Connection;
 
-use crate::settings::Settings;
+use crate::settings::{self, Settings};
 
 // ---------------------------------------------------------------------------
 // Embedded audio assets
@@ -31,6 +30,10 @@ const ALERT_WORK: &[u8] = include_bytes!("../../../static/audio/alert-work.mp3")
 const ALERT_SHORT_BREAK: &[u8] = include_bytes!("../../../static/audio/alert-short-break.mp3");
 const ALERT_LONG_BREAK: &[u8] = include_bytes!("../../../static/audio/alert-long-break.mp3");
 const TICK: &[u8] = include_bytes!("../../../static/audio/tick.mp3");
+const SOFT_BELL: &[u8] = include_bytes!("../../../static/audio/soft-bell.wav");
+const MARIMBA: &[u8] = include_bytes!("../../../static/audio/marimba.wav");
+const DROPLET: &[u8] = include_bytes!("../../../static/audio/droplet.wav");
+const PREVIEW_DURATION: Duration = Duration::from_secs(3);
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -44,26 +47,140 @@ pub enum AudioCue {
     Tick,
 }
 
-/// Paths to currently active custom audio files (one per alert cue).
-/// `None` means the embedded default is used.
-#[derive(Default)]
-pub struct CustomAudioPaths {
-    pub work_alert: Option<PathBuf>,
-    pub short_break_alert: Option<PathBuf>,
-    pub long_break_alert: Option<PathBuf>,
+#[derive(Debug, Clone, Copy)]
+pub enum AlertCue {
+    Work,
+    ShortBreak,
+    LongBreak,
 }
 
-/// Serialisable snapshot of custom audio file names (sent to the frontend).
+impl AlertCue {
+    const ALL: [Self; 3] = [Self::Work, Self::ShortBreak, Self::LongBreak];
+
+    fn stem(self) -> &'static str {
+        match self {
+            Self::Work => "custom_work_alert",
+            Self::ShortBreak => "custom_short_break_alert",
+            Self::LongBreak => "custom_long_break_alert",
+        }
+    }
+
+    fn preset_key(self) -> String {
+        format!("{}_preset", self.stem())
+    }
+
+    fn name_key(self) -> String {
+        format!("{}_name", self.stem())
+    }
+
+    fn file_key(self) -> String {
+        format!("{}_file", self.stem())
+    }
+
+    fn file_names(self) -> [String; 2] {
+        [format!("{}_a", self.stem()), format!("{}_b", self.stem())]
+    }
+}
+
+impl std::str::FromStr for AlertCue {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "work_alert" => Ok(Self::Work),
+            "short_break_alert" => Ok(Self::ShortBreak),
+            "long_break_alert" => Ok(Self::LongBreak),
+            _ => Err(format!("unknown audio cue: {value}")),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AudioPreset {
+    #[default]
+    Classic,
+    SoftBell,
+    Marimba,
+    Droplet,
+    Custom,
+}
+
+impl std::str::FromStr for AudioPreset {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "classic" => Ok(Self::Classic),
+            "soft-bell" => Ok(Self::SoftBell),
+            "marimba" => Ok(Self::Marimba),
+            "droplet" => Ok(Self::Droplet),
+            "custom" => Ok(Self::Custom),
+            _ => Err(format!("unknown audio preset: {value}")),
+        }
+    }
+}
+
+impl AudioPreset {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Classic => "classic",
+            Self::SoftBell => "soft-bell",
+            Self::Marimba => "marimba",
+            Self::Droplet => "droplet",
+            Self::Custom => "custom",
+        }
+    }
+
+    fn embedded_for(self, cue: AudioCue) -> &'static [u8] {
+        match self {
+            Self::SoftBell => SOFT_BELL,
+            Self::Marimba => MARIMBA,
+            Self::Droplet => DROPLET,
+            Self::Classic | Self::Custom => match cue {
+                AudioCue::WorkAlert => ALERT_WORK,
+                AudioCue::ShortBreakAlert => ALERT_SHORT_BREAK,
+                AudioCue::LongBreakAlert => ALERT_LONG_BREAK,
+                AudioCue::Tick => TICK,
+            },
+        }
+    }
+}
+
+#[derive(Default)]
+struct AlertSound {
+    preset: AudioPreset,
+    custom: Option<CustomSound>,
+}
+
+struct CustomSound {
+    path: PathBuf,
+    name: String,
+}
+
+/// The selected preset and retained import for each alert cue.
+#[derive(Default)]
+pub struct AlertSounds([AlertSound; 3]);
+
+#[derive(serde::Serialize)]
+pub struct AudioPresets {
+    pub work_alert: AudioPreset,
+    pub short_break_alert: AudioPreset,
+    pub long_break_alert: AudioPreset,
+}
+
+/// Selected presets and the names of any retained custom files.
 #[derive(serde::Serialize)]
 pub struct CustomAudioInfo {
     pub work_alert: Option<String>,
     pub short_break_alert: Option<String>,
     pub long_break_alert: Option<String>,
+    pub presets: AudioPresets,
 }
 
 struct PlayRequest {
     cue: AudioCue,
-    /// Resolved custom file path, if one is configured for this cue.
+    preset: AudioPreset,
     custom_path: Option<PathBuf>,
     volume: f32,
     /// When the request was made; used to skip ticks that are already late.
@@ -91,27 +208,28 @@ impl From<&Settings> for AudioSettings {
 /// Thread-safe audio manager. Register as `Arc<AudioManager>` in Tauri state.
 pub struct AudioManager {
     tx: mpsc::SyncSender<PlayRequest>,
-    settings: Arc<Mutex<AudioSettings>>,
-    pub custom_paths: Arc<Mutex<CustomAudioPaths>>,
+    settings: Mutex<AudioSettings>,
+    pub alerts: Mutex<AlertSounds>,
 }
 
 impl AudioManager {
     /// Spawn the audio thread and return an `Arc<AudioManager>`.
-    /// If the system audio device is unavailable, returns `None` (app still works, just silent).
-    pub fn new(initial: &Settings) -> Option<Arc<Self>> {
+    pub fn new(initial: &Settings, alerts: AlertSounds) -> Arc<Self> {
         let (tx, rx) = mpsc::sync_channel::<PlayRequest>(8);
 
-        std::thread::Builder::new()
+        if let Err(e) = std::thread::Builder::new()
             .name("audio".to_string())
             .spawn(move || audio_thread(rx))
-            .ok()?;
+        {
+            log::warn!("[audio] failed to start audio thread: {e}");
+        }
 
         log::info!("[audio] initialized: volume={:.0}%", initial.volume * 100.0);
-        Some(Arc::new(Self {
+        Arc::new(Self {
             tx,
-            settings: Arc::new(Mutex::new(AudioSettings::from(initial))),
-            custom_paths: Arc::new(Mutex::new(CustomAudioPaths::default())),
-        }))
+            settings: Mutex::new(AudioSettings::from(initial)),
+            alerts: Mutex::new(alerts),
+        })
     }
 
     /// Update volume and tick-sound settings from a new `Settings` snapshot.
@@ -122,21 +240,63 @@ impl AudioManager {
     /// Play the given cue at the current stored volume.
     /// Non-blocking: drops the request if the channel is full.
     pub fn play_cue(&self, cue: AudioCue) {
+        if let Some(req) = self.play_request(cue) {
+            let _ = self.tx.try_send(req);
+        }
+    }
+
+    /// Play up to three seconds of an alert independently of the timer audio queue.
+    pub async fn preview(&self, cue: AlertCue) -> Result<(), String> {
+        self.preview_with(cue, |req| play(req, Some(PREVIEW_DURATION)))
+            .await
+    }
+
+    async fn preview_with(
+        &self,
+        cue: AlertCue,
+        playback: impl FnOnce(PlayRequest) -> Result<(), String> + Send + 'static,
+    ) -> Result<(), String> {
+        let cue = match cue {
+            AlertCue::Work => AudioCue::WorkAlert,
+            AlertCue::ShortBreak => AudioCue::ShortBreakAlert,
+            AlertCue::LongBreak => AudioCue::LongBreakAlert,
+        };
+        let Some(req) = self.play_request(cue) else {
+            return Ok(());
+        };
+        tokio::task::spawn_blocking(move || playback(req))
+            .await
+            .map_err(|e| format!("audio preview worker failed: {e}"))?
+    }
+
+    fn play_request(&self, cue: AudioCue) -> Option<PlayRequest> {
         let volume = self.settings.lock().unwrap().volume;
         if volume <= 0.0 {
-            return;
+            return None;
         }
-        // Resolve custom path (Tick always uses the embedded sound).
-        let custom_path = {
-            let paths = self.custom_paths.lock().unwrap();
-            match cue {
-                AudioCue::WorkAlert => paths.work_alert.clone(),
-                AudioCue::ShortBreakAlert => paths.short_break_alert.clone(),
-                AudioCue::LongBreakAlert => paths.long_break_alert.clone(),
-                AudioCue::Tick => None,
-            }
+        let alert = match cue {
+            AudioCue::WorkAlert => Some(AlertCue::Work),
+            AudioCue::ShortBreakAlert => Some(AlertCue::ShortBreak),
+            AudioCue::LongBreakAlert => Some(AlertCue::LongBreak),
+            AudioCue::Tick => None,
         };
-        let _ = self.tx.try_send(PlayRequest { cue, custom_path, volume, requested_at: Instant::now() });
+        let (preset, custom_path) = alert
+            .map(|alert| {
+                let sounds = self.alerts.lock().unwrap();
+                let sound = &sounds.0[alert as usize];
+                let custom_path = sound.custom.as_ref().and_then(|custom| {
+                    (sound.preset == AudioPreset::Custom).then(|| custom.path.clone())
+                });
+                (sound.preset, custom_path)
+            })
+            .unwrap_or_default();
+        Some(PlayRequest {
+            cue,
+            preset,
+            custom_path,
+            volume,
+            requested_at: Instant::now(),
+        })
     }
 
     /// Returns true if tick sounds are enabled for the given round type string.
@@ -147,75 +307,217 @@ impl AudioManager {
             _ => s.tick_sounds_break,
         }
     }
+}
 
-    /// Set a custom file path for the given cue slot.
-    /// `cue` must be `"work_alert"`, `"short_break_alert"`, or `"long_break_alert"`.
-    pub fn set_custom_path(&self, cue: &str, path: PathBuf) {
-        let mut paths = self.custom_paths.lock().unwrap();
-        match cue {
-            "work_alert" => paths.work_alert = Some(path),
-            "short_break_alert" => paths.short_break_alert = Some(path),
-            "long_break_alert" => paths.long_break_alert = Some(path),
-            _ => {}
-        }
+impl AlertSounds {
+    pub fn load(conn: &Connection, dir: &Path) -> Self {
+        Self(AlertCue::ALL.map(|cue| {
+            let preset = settings::get_setting(conn, &cue.preset_key());
+            let name = settings::get_setting(conn, &cue.name_key());
+            let [first, second] = cue.file_names();
+            let path = match settings::get_setting(conn, &cue.file_key()) {
+                Some(file) if file == first || file == second => Some(dir.join(file)),
+                None if preset.is_none() || name.is_some() => find_legacy_file(dir, cue),
+                _ => None,
+            };
+            let custom = path.filter(|path| path.is_file()).map(|path| CustomSound {
+                name: name.unwrap_or_else(|| {
+                    path.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                }),
+                path,
+            });
+            let preset = preset.as_deref().map_or_else(
+                || {
+                    if custom.is_some() {
+                        AudioPreset::Custom
+                    } else {
+                        AudioPreset::Classic
+                    }
+                },
+                |value| value.parse().unwrap_or_default(),
+            );
+            let preset = match (preset, &custom) {
+                (AudioPreset::Custom, None) => AudioPreset::Classic,
+                _ => preset,
+            };
+            AlertSound { preset, custom }
+        }))
     }
 
-    /// Remove the custom path for the given cue slot, reverting to the built-in sound.
-    pub fn clear_custom_path(&self, cue: &str) {
-        let mut paths = self.custom_paths.lock().unwrap();
-        match cue {
-            "work_alert" => paths.work_alert = None,
-            "short_break_alert" => paths.short_break_alert = None,
-            "long_break_alert" => paths.long_break_alert = None,
-            _ => {}
-        }
-    }
-
-    /// Return the display names (file names only) of any configured custom files.
-    pub fn get_custom_info(&self) -> CustomAudioInfo {
-        let paths = self.custom_paths.lock().unwrap();
-        let name = |p: &Option<PathBuf>| -> Option<String> {
-            p.as_ref()
-                .and_then(|pb| pb.file_name())
-                .and_then(|n| n.to_str())
-                .map(String::from)
-        };
+    pub fn info(&self) -> CustomAudioInfo {
+        let [work, short, long] = &self.0;
+        let name = |sound: &AlertSound| sound.custom.as_ref().map(|custom| custom.name.clone());
         CustomAudioInfo {
-            work_alert: name(&paths.work_alert),
-            short_break_alert: name(&paths.short_break_alert),
-            long_break_alert: name(&paths.long_break_alert),
+            work_alert: name(work),
+            short_break_alert: name(short),
+            long_break_alert: name(long),
+            presets: AudioPresets {
+                work_alert: work.preset,
+                short_break_alert: short.preset,
+                long_break_alert: long.preset,
+            },
+        }
+    }
+
+    pub fn set_preset(
+        &mut self,
+        conn: &mut Connection,
+        cue: AlertCue,
+        preset: AudioPreset,
+    ) -> Result<(), String> {
+        let sound = &mut self.0[cue as usize];
+        if preset == AudioPreset::Custom
+            && !sound
+                .custom
+                .as_ref()
+                .is_some_and(|custom| custom.path.is_file())
+        {
+            return Err("no custom file available for this cue".into());
+        }
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        if let Some(custom) = &sound.custom {
+            settings::save_setting(&tx, &cue.name_key(), &custom.name)
+                .map_err(|e| e.to_string())?;
+        }
+        settings::save_setting(&tx, &cue.preset_key(), preset.as_str())
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        sound.preset = preset;
+        Ok(())
+    }
+
+    pub fn import(
+        &mut self,
+        conn: &mut Connection,
+        dir: &Path,
+        cue: AlertCue,
+        src: &Path,
+    ) -> Result<String, String> {
+        let sound = &mut self.0[cue as usize];
+        let name = src
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let [first, second] = cue.file_names();
+        // Copy to the inactive slot so the previous import survives validation and DB failures.
+        let file = if sound
+            .custom
+            .as_ref()
+            .is_some_and(|custom| custom.path.ends_with(&first))
+        {
+            second
+        } else {
+            first
+        };
+        let path = dir.join(&file);
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        if src
+            .canonicalize()
+            .ok()
+            .is_some_and(|src| Some(src) == path.canonicalize().ok())
+        {
+            return Err("source file already belongs to this alert".into());
+        }
+        let result = (|| {
+            std::fs::copy(src, &path).map_err(|e| e.to_string())?;
+            probe_audio_file(&path)?;
+
+            let tx = conn.transaction().map_err(|e| e.to_string())?;
+            settings::save_setting(&tx, &cue.name_key(), &name).map_err(|e| e.to_string())?;
+            settings::save_setting(&tx, &cue.file_key(), &file).map_err(|e| e.to_string())?;
+            settings::save_setting(&tx, &cue.preset_key(), AudioPreset::Custom.as_str())
+                .map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())
+        })();
+        if let Err(error) = result {
+            remove_audio_file(&path);
+            return Err(error);
+        }
+        remove_unused_files(dir, cue, Some(&path));
+        *sound = AlertSound {
+            preset: AudioPreset::Custom,
+            custom: Some(CustomSound {
+                path,
+                name: name.clone(),
+            }),
+        };
+        Ok(name)
+    }
+
+    pub fn clear(
+        &mut self,
+        conn: &mut Connection,
+        dir: &Path,
+        cue: AlertCue,
+    ) -> Result<(), String> {
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM settings WHERE key IN (?1, ?2)",
+            rusqlite::params![cue.name_key(), cue.file_key()],
+        )
+        .map_err(|e| e.to_string())?;
+        settings::save_setting(&tx, &cue.preset_key(), AudioPreset::Classic.as_str())
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        self.0[cue as usize] = AlertSound::default();
+        remove_unused_files(dir, cue, None);
+        Ok(())
+    }
+
+    /// Explicit defaults keep an undeletable legacy file from reappearing after a reset.
+    pub fn save_classic_presets(conn: &Connection) -> rusqlite::Result<()> {
+        for cue in AlertCue::ALL {
+            settings::save_setting(conn, &cue.preset_key(), AudioPreset::Classic.as_str())?;
+        }
+        Ok(())
+    }
+
+    pub fn reset(&mut self, dir: &Path) {
+        *self = Self::default();
+        for cue in AlertCue::ALL {
+            remove_unused_files(dir, cue, None);
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Startup helper — scan disk for previously saved custom files
-// ---------------------------------------------------------------------------
+fn find_legacy_file(dir: &Path, cue: AlertCue) -> Option<PathBuf> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .find(|path| {
+            path.is_file() && path.file_stem().and_then(|s| s.to_str()) == Some(cue.stem())
+        })
+}
 
-/// Fixed file stems used when copying custom audio files into the config dir.
-pub const STEM_WORK: &str = "custom_work_alert";
-pub const STEM_SHORT: &str = "custom_short_break_alert";
-pub const STEM_LONG: &str = "custom_long_break_alert";
+fn remove_unused_files(dir: &Path, cue: AlertCue, keep: Option<&Path>) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        let [first, second] = cue.file_names();
+        for path in entries.filter_map(|entry| entry.ok().map(|entry| entry.path())) {
+            let legacy = path.file_stem().and_then(|stem| stem.to_str()) == Some(cue.stem());
+            let managed = path.ends_with(&first) || path.ends_with(&second);
+            if (legacy || managed) && Some(path.as_path()) != keep && path.is_file() {
+                remove_audio_file(&path);
+            }
+        }
+    }
+}
 
-/// Scan `audio_dir` for any saved custom audio files and return the paths.
-pub fn find_custom_files(audio_dir: &Path) -> CustomAudioPaths {
-    let find = |stem: &str| -> Option<PathBuf> {
-        let entries = std::fs::read_dir(audio_dir).ok()?;
-        entries
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .find(|p| p.file_stem().and_then(|s| s.to_str()) == Some(stem))
-    };
-    CustomAudioPaths {
-        work_alert: find(STEM_WORK),
-        short_break_alert: find(STEM_SHORT),
-        long_break_alert: find(STEM_LONG),
+fn remove_audio_file(path: &Path) {
+    if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            log::warn!("[audio] could not remove {path:?}: {e}");
+        }
     }
 }
 
 /// Probe `path` by attempting to construct a `rodio::Decoder`.
 /// Returns `Ok(())` if the format and codec are recognised, or an error
 /// string suitable for returning to the frontend.
-pub fn probe_audio_file(path: &Path) -> Result<(), String> {
+fn probe_audio_file(path: &Path) -> Result<(), String> {
     let reader = std::fs::File::open(path)
         .map(std::io::BufReader::new)
         .map_err(|e| format!("cannot open file: {e}"))?;
@@ -236,58 +538,50 @@ fn audio_thread(rx: mpsc::Receiver<PlayRequest>) {
     while let Ok(req) = rx.recv() {
         // Sounds play one at a time, so ticks requested during a long alert
         // wait behind it and would then play back-to-back. Skip late ticks.
-        if matches!(req.cue, AudioCue::Tick) && req.requested_at.elapsed() > Duration::from_millis(500) {
+        if matches!(req.cue, AudioCue::Tick)
+            && req.requested_at.elapsed() > Duration::from_millis(500)
+        {
             continue;
         }
 
-        let mut device_sink = match DeviceSinkBuilder::open_default_sink() {
-            Ok(s) => s,
-            Err(e) => {
-                log::warn!("[audio] failed to open output stream: {e}");
-                continue;
-            }
-        };
-        device_sink.log_on_drop(false);
-
-        let player = Player::connect_new(device_sink.mixer());
-        player.set_volume(req.volume);
-
-        // Try the custom file first; fall back to the embedded asset on any error.
-        let used_custom = if let Some(path) = req.custom_path {
-            match std::fs::File::open(&path).map(std::io::BufReader::new) {
-                Ok(reader) => match Decoder::new(reader) {
-                    Ok(source) => { player.append(source); true }
-                    Err(e) => {
-                        log::warn!("[audio] decode error for {path:?}: {e}");
-                        false
-                    }
-                },
-                Err(e) => {
-                    log::warn!("[audio] cannot open {path:?}: {e}");
-                    false
-                }
-            }
-        } else {
-            false
-        };
-
-        if !used_custom {
-            let bytes: &'static [u8] = match req.cue {
-                AudioCue::WorkAlert => ALERT_WORK,
-                AudioCue::ShortBreakAlert => ALERT_SHORT_BREAK,
-                AudioCue::LongBreakAlert => ALERT_LONG_BREAK,
-                AudioCue::Tick => TICK,
-            };
-            match Decoder::new(Cursor::new(bytes)) {
-                Ok(source) => player.append(source),
-                Err(e) => log::warn!("[audio] embedded decode error: {e}"),
-            }
+        if let Err(e) = play(req, None) {
+            log::warn!("[audio] {e}");
         }
-
-        // Block until playback completes so device_sink stays alive for the
-        // full duration and drops cleanly afterward.
-        player.sleep_until_end();
     }
+}
+
+fn play(req: PlayRequest, limit: Option<Duration>) -> Result<(), String> {
+    let mut device_sink = DeviceSinkBuilder::open_default_sink()
+        .map_err(|e| format!("cannot open audio output: {e}"))?;
+    device_sink.log_on_drop(false);
+
+    let player = Player::connect_new(device_sink.mixer());
+    player.set_volume(req.volume);
+    let source = decode_sound(&req)?;
+    if let Some(limit) = limit {
+        player.append(source.take_duration(limit));
+    } else {
+        player.append(source);
+    }
+    player.sleep_until_end();
+    Ok(())
+}
+
+fn decode_sound(req: &PlayRequest) -> Result<Box<dyn Source + Send>, String> {
+    if let Some(path) = &req.custom_path {
+        match std::fs::File::open(path).map(std::io::BufReader::new) {
+            Ok(reader) => match Decoder::new(reader) {
+                Ok(source) => return Ok(Box::new(source)),
+                Err(e) => log::warn!("[audio] decode error for {path:?}: {e}"),
+            },
+            Err(e) => log::warn!("[audio] cannot open {path:?}: {e}"),
+        }
+    }
+
+    let bytes = req.preset.embedded_for(req.cue);
+    let source =
+        Decoder::new(Cursor::new(bytes)).map_err(|e| format!("embedded decode error: {e}"))?;
+    Ok(Box::new(source))
 }
 
 // ---------------------------------------------------------------------------
@@ -299,11 +593,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn audio_cue_bytes_are_non_empty() {
-        assert!(!ALERT_WORK.is_empty());
-        assert!(!ALERT_SHORT_BREAK.is_empty());
-        assert!(!ALERT_LONG_BREAK.is_empty());
-        assert!(!TICK.is_empty());
+    fn embedded_presets_decode() {
+        for bytes in [
+            ALERT_WORK,
+            ALERT_SHORT_BREAK,
+            ALERT_LONG_BREAK,
+            TICK,
+            SOFT_BELL,
+            MARIMBA,
+            DROPLET,
+        ] {
+            assert!(Decoder::new(Cursor::new(bytes)).unwrap().next().is_some());
+        }
     }
 
     #[test]
@@ -315,8 +616,8 @@ mod tests {
         };
         let mgr = AudioManager {
             tx: mpsc::sync_channel(1).0,
-            settings: Arc::new(Mutex::new(AudioSettings::from(&settings))),
-            custom_paths: Arc::new(Mutex::new(CustomAudioPaths::default())),
+            settings: Mutex::new(AudioSettings::from(&settings)),
+            alerts: Mutex::new(AlertSounds::default()),
         };
         assert!(mgr.tick_enabled_for("work"));
         assert!(!mgr.tick_enabled_for("short-break"));
@@ -324,19 +625,230 @@ mod tests {
     }
 
     #[test]
-    fn custom_paths_set_and_clear() {
-        let settings = Settings::default();
+    fn preview_shares_sound_settings_and_leaves_room_for_a_timer_alert() {
+        let settings = Settings {
+            volume: 0.4,
+            ..Settings::default()
+        };
+        let (tx, rx) = mpsc::sync_channel(2);
+        let mgr = Arc::new(AudioManager {
+            tx,
+            settings: Mutex::new(AudioSettings::from(&settings)),
+            alerts: Mutex::new(AlertSounds::default()),
+        });
+        let path = PathBuf::from("custom.wav");
+        mgr.alerts.lock().unwrap().0[AlertCue::LongBreak as usize] = AlertSound {
+            preset: AudioPreset::Custom,
+            custom: Some(CustomSound {
+                path: path.clone(),
+                name: "custom.wav".into(),
+            }),
+        };
+        mgr.play_cue(AudioCue::Tick);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (started, request) = tokio::sync::oneshot::channel();
+            let (end_preview, release) = mpsc::channel();
+            let preview_mgr = Arc::clone(&mgr);
+            let preview = tokio::spawn(async move {
+                preview_mgr
+                    .preview_with(AlertCue::LongBreak, move |req| {
+                        started.send(req).ok();
+                        release.recv().map_err(|e| e.to_string())
+                    })
+                    .await
+            });
+            let preview_request = tokio::time::timeout(Duration::from_secs(2), request)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!preview.is_finished());
+
+            mgr.play_cue(AudioCue::LongBreakAlert);
+            assert!(matches!(rx.try_recv().unwrap().cue, AudioCue::Tick));
+            let alert_request = rx.try_recv().unwrap();
+            assert!(matches!(alert_request.cue, AudioCue::LongBreakAlert));
+            assert!(matches!(preview_request.cue, AudioCue::LongBreakAlert));
+            assert_eq!(alert_request.preset, AudioPreset::Custom);
+            assert_eq!(preview_request.preset, alert_request.preset);
+            assert_eq!(alert_request.custom_path.as_deref(), Some(path.as_path()));
+            assert_eq!(preview_request.custom_path, alert_request.custom_path);
+            assert_eq!(alert_request.volume, 0.4);
+            assert_eq!(preview_request.volume, alert_request.volume);
+
+            end_preview.send(()).unwrap();
+            preview.await.unwrap().unwrap();
+        });
+    }
+
+    #[test]
+    fn muted_preview_succeeds_without_a_playback_queue() {
+        let settings = Settings {
+            volume: 0.0,
+            ..Settings::default()
+        };
         let mgr = AudioManager {
             tx: mpsc::sync_channel(1).0,
-            settings: Arc::new(Mutex::new(AudioSettings::from(&settings))),
-            custom_paths: Arc::new(Mutex::new(CustomAudioPaths::default())),
+            settings: Mutex::new(AudioSettings::from(&settings)),
+            alerts: Mutex::new(AlertSounds::default()),
         };
-        mgr.set_custom_path("work_alert", PathBuf::from("/tmp/test.mp3"));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(mgr.preview(AlertCue::Work)).unwrap();
+    }
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "pomotroid-audio-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            for entry in std::fs::read_dir(&self.0).unwrap().flatten() {
+                let _ = std::fs::remove_file(entry.path());
+            }
+            let _ = std::fs::remove_dir(&self.0);
+        }
+    }
+
+    #[test]
+    fn legacy_import_and_independent_presets_survive_restart_and_clear() {
+        let dir = TestDir::new();
+        let db = dir.0.join("settings.db");
+        let legacy = dir.0.join("custom_work_alert.wav");
+        std::fs::write(&legacy, SOFT_BELL).unwrap();
+        {
+            let mut conn = Connection::open(&db).unwrap();
+            crate::db::migrations::run(&conn).unwrap();
+            settings::save_setting(&conn, "custom_work_alert_name", "My chime.wav").unwrap();
+            let mut sounds = AlertSounds::load(&conn, &dir.0);
+            assert_eq!(sounds.info().presets.work_alert, AudioPreset::Custom);
+            sounds
+                .set_preset(&mut conn, AlertCue::Work, AudioPreset::SoftBell)
+                .unwrap();
+            sounds
+                .set_preset(&mut conn, AlertCue::ShortBreak, AudioPreset::Marimba)
+                .unwrap();
+            assert!(sounds
+                .set_preset(&mut conn, AlertCue::LongBreak, AudioPreset::Custom)
+                .is_err());
+        }
+        {
+            let mut conn = Connection::open(&db).unwrap();
+            let mut sounds = AlertSounds::load(&conn, &dir.0);
+            let info = serde_json::to_value(sounds.info()).unwrap();
+            assert_eq!(
+                info,
+                serde_json::json!({
+                    "work_alert": "My chime.wav",
+                    "short_break_alert": null,
+                    "long_break_alert": null,
+                    "presets": {
+                        "work_alert": "soft-bell",
+                        "short_break_alert": "marimba",
+                        "long_break_alert": "classic",
+                    }
+                })
+            );
+            assert!(legacy.is_file());
+            sounds
+                .set_preset(&mut conn, AlertCue::Work, AudioPreset::Custom)
+                .unwrap();
+            assert_eq!(sounds.info().presets.work_alert, AudioPreset::Custom);
+            sounds.clear(&mut conn, &dir.0, AlertCue::Work).unwrap();
+            assert!(!legacy.exists());
+            let cleared = AlertSounds::load(&conn, &dir.0).info();
+            assert!(cleared.work_alert.is_none());
+            assert_eq!(cleared.presets.work_alert, AudioPreset::Classic);
+            assert_eq!(cleared.presets.short_break_alert, AudioPreset::Marimba);
+        }
+    }
+
+    #[test]
+    fn replacement_preserves_previous_import_on_failure() {
+        let dir = TestDir::new();
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::migrations::run(&conn).unwrap();
+        let mut sounds = AlertSounds::load(&conn, &dir.0);
+        let original = dir.0.join("bell.wav");
+        let new_file = dir.0.join("droplet.wav");
+        std::fs::write(&original, SOFT_BELL).unwrap();
+        std::fs::write(&new_file, DROPLET).unwrap();
         assert_eq!(
-            mgr.custom_paths.lock().unwrap().work_alert,
-            Some(PathBuf::from("/tmp/test.mp3"))
+            sounds
+                .import(&mut conn, &dir.0, AlertCue::Work, &original)
+                .unwrap(),
+            "bell.wav"
         );
-        mgr.clear_custom_path("work_alert");
-        assert!(mgr.custom_paths.lock().unwrap().work_alert.is_none());
+        let bad = dir.0.join("bad.wav");
+        std::fs::write(&bad, b"invalid").unwrap();
+        assert!(sounds
+            .import(&mut conn, &dir.0, AlertCue::Work, &bad)
+            .is_err());
+
+        conn.execute_batch(
+            "CREATE TRIGGER fail_file_update BEFORE UPDATE ON settings
+            WHEN NEW.key = 'custom_work_alert_file'
+            BEGIN SELECT RAISE(ABORT, 'test write failure'); END;",
+        )
+        .unwrap();
+        assert!(sounds
+            .import(&mut conn, &dir.0, AlertCue::Work, &new_file)
+            .is_err());
+        assert_eq!(sounds.info().presets.work_alert, AudioPreset::Custom);
+        let reloaded = AlertSounds::load(&conn, &dir.0);
+        assert_eq!(reloaded.info().work_alert.as_deref(), Some("bell.wav"));
+        let original_path = &reloaded.0[AlertCue::Work as usize]
+            .custom
+            .as_ref()
+            .unwrap()
+            .path;
+        assert_eq!(std::fs::read(original_path).unwrap(), SOFT_BELL);
+
+        conn.execute("DROP TRIGGER fail_file_update", []).unwrap();
+        sounds
+            .import(&mut conn, &dir.0, AlertCue::Work, &new_file)
+            .unwrap();
+        assert!(!original_path.exists());
+        assert_eq!(
+            AlertSounds::load(&conn, &dir.0)
+                .info()
+                .work_alert
+                .as_deref(),
+            Some("droplet.wav")
+        );
+        conn.execute("DELETE FROM settings", []).unwrap();
+        AlertSounds::save_classic_presets(&conn).unwrap();
+        sounds.reset(&dir.0);
+        assert_eq!(sounds.info().presets.work_alert, AudioPreset::Classic);
+        assert!(AlertSounds::load(&conn, &dir.0).info().work_alert.is_none());
+    }
+
+    #[test]
+    fn invalid_cues_and_presets_are_rejected() {
+        assert!("tick".parse::<AlertCue>().is_err());
+        assert!("work_alert".parse::<AlertCue>().is_ok());
+        assert!("unknown".parse::<AudioPreset>().is_err());
+        assert_eq!(
+            "soft-bell".parse::<AudioPreset>().unwrap(),
+            AudioPreset::SoftBell
+        );
     }
 }

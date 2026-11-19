@@ -1,0 +1,13 @@
+{
+  "name": "Fluent Calm Light",
+  "colors": {
+    "--color-long-round": "#496C96",
+    "--color-short-round": "#44745B",
+    "--color-focus-round": "#B44F40",
+    "--color-background": "#F5F5F2",
+    "--color-background-light": "#FFFFFF",
+    "--color-foreground": "#252C27",
+    "--color-foreground-darker": "#505D55",
+    "--color-accent": "#B44F40"
+  }
+}

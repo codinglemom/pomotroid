@@ -1,144 +1,86 @@
-<div align="center">
-  <img alt="Pomotroid" src=".github/images/pomotroid-title.png" width="800px">
-</div>
-<div align="center">
-  <img alt="Pomotroid in action" src=".github/images/pomotroid-screens.png" width="800px">
-</div>
+<img src="./src-tauri/installer/art/tomato.svg" alt="小番茄图标" width="56">
 
-<p align="center">Simple and visually-pleasing Pomodoro timer.</p>
+# 小番茄
 
----
+小番茄是一款可以悬浮在桌面上的番茄钟。你可以自定义专注和休息时长，再把完成的专注轮次记入自己的奖励基金。
 
-- [Overview](#overview)
-- [Features](#features)
-- [Statistics](#statistics)
-- [Themes](#themes)
-- [Install](#install)
-- [WebSocket API](#websocket-api)
-- [Development](#development)
-- [License](#license)
+这是基于 Pomotroid 开发的分支。本 README 介绍小番茄的功能和 Windows x64 构建方式。[小番茄 Fork](https://github.com/codinglemom/pomotroid) · [上游 Pomotroid](https://github.com/Splode/pomotroid)
 
-## Overview
+## 安装 Windows x64 版
 
-Pomotroid is a simple and configurable Pomodoro timer. It aims to provide a visually-pleasing and reliable way to track productivity using the Pomodoro Technique.
+目前可通过[源码构建](#从源码构建)获取安装包。预编译安装包的发布状态见[小番茄 Fork 的 Releases](https://github.com/codinglemom/pomotroid/releases)。
 
-Built with [Tauri 2](https://tauri.app), [Rust](https://www.rust-lang.org), and [Svelte 5](https://svelte.dev).
+构建完成后双击 `src-tauri/target/release/bundle/nsis/` 下的 `小番茄_*_x64-setup.exe`，按向导完成安装，再从 Windows 开始菜单搜索「小番茄」打开。安装版会注册 Windows 桌面通知所需的应用身份。
 
-## Features
+## 快速上手
 
-- **Configurable timer** — customise work duration, break durations, and the number of rounds per long break
-- **Statistics** — daily, weekly, and all-time session history with charts and a 52-week heatmap
-- **38 bundled themes** — including Dracula, Nord, Tokyo Night, Catppuccin, Gruvbox, Rose Piné, and more; auto-switches with your OS light/dark preference
-- **Custom themes** — drop a JSON file into the themes folder; applied instantly without a restart
-- **Localization** — 8 languages: English, Spanish, French, German, Japanese, Chinese (Simplified), Turkish, and Portuguese; auto-detects OS language
-- **Global shortcuts** — control the timer from anywhere, even when the window is hidden
-- **Custom audio** — replace the built-in alert sounds with your own files
-- **Tick sounds** — optional ticking during work and break rounds, independently toggleable
-- **Dynamic tray icon** — progress arc updates in real time; reflects round type and pause state
-- **Minimise / close to tray** — keep Pomotroid running in the background
-- **Desktop notifications** — native OS alerts on round transitions
-- **Compact mode** — a minimal set of controls appears when the window is resized small
-- **Always on top** — optionally keep the timer above other windows
-- **WebSocket server** — opt-in local server for stream overlays and external integrations
-- **Diagnostic logging** — rotating log file with a one-click shortcut to the log folder
+1. 点击主窗口的「开始」即可计时。初次使用默认每轮专注 25 分钟、短休息 5 分钟，每完成 4 轮安排一次 15 分钟的长休息。
+2. 打开「设置 → 计时器」可以调整时长、长休息前的轮数，以及专注和休息是否自动开始。
+3. 点击主窗口的「统计」，可查看今日的专注时长、本周的记录和年度热力图。
 
-## Statistics
+## 表盘与桌面悬浮
 
-Pomotroid tracks every completed session and surfaces the data across three views: a daily summary with an hourly breakdown, a weekly bar chart with streak tracking, and an all-time 52-week heatmap.
+在「设置 → 外观 → 计时器样式」中可选 **圆环、翻页钟、辉光管、沙漏**四种表盘。
 
-<div align="center">
-  <img alt="Pomotroid statistics window" src=".github/images/pomotroid-stats.png" width="800px">
-</div>
+点击主窗口标题栏的「显示悬浮番茄钟」，当前计时会继续在可拖动、始终置顶的小窗中显示。圆环会在悬浮时显示为辉光管，辉光管和翻页钟保留各自的外观。沙漏用于主窗口。点击小窗的「还原主窗口」即可回到原来的表盘。
 
-## Themes
+<img src="./docs/images/desktop-widget.png" alt="小番茄的辉光管悬浮窗，显示倒计时和进度条" width="440">
 
-Pomotroid ships with 38 themes and supports fully custom themes with live hot-reload.
+## 托盘、通知与提示音
 
-![Screenshots of Pomotroid using various themes](.github/images/pomotroid-themes-preview.png)
+- **系统托盘**。在「设置 → 系统 → 系统托盘」开启「显示在系统托盘」，再按需启用「最小化到托盘」或「关闭到托盘」。Windows 上左键点击小番茄图标可显示或隐藏主窗口，右键可以从托盘面板控制计时。
+- **桌面通知**。在「设置 → 通知」开启「桌面通知」，点击「发送测试通知」即可到 Windows 通知中心确认显示情况。若看不到通知，可以在 Windows 中检查小番茄的通知权限和勿扰模式。
+- **提示音**。在同一页可分别为专注、短休息和长休息选用经典、柔铃、木琴、水滴，也可选择自己的音频文件并试听。专注和休息时的滴答声可分别开关。
 
-See [THEMES.md](./THEMES.md) for the full theme list and instructions on creating your own.
+## 奖励基金
 
-## Install
+在「设置 → 奖励基金」保存每小时奖励金额。此后自然完成的专注轮次会按开始时的费率入账，每轮单独四舍五入到分。例如每小时设为 ¥10.00，完成 25 分钟专注可获得 ¥4.17。新费率从下一次开始的轮次生效，休息、跳过、重置和未完成的轮次均无奖励，既往专注也不会补发。
 
-### Download
+在「统计 → 奖励基金」可查看余额、每日收入和收支流水，并填写金额与用途来记录支出。每日收入按本地入账日期统计，支出从余额扣除。
 
-Download the latest release from the [releases](https://github.com/Splode/pomotroid/releases) page.
+## 自定义主题
 
-Available for **Windows** (installer + standalone exe), **macOS** (universal DMG), and **Linux** (`.deb` + AppImage).
-
-> **Note:** Pomotroid is currently unsigned. Depending on your OS security settings you may see a warning on first launch — this is expected and can be safely dismissed.
-
-### Linux notes
-
-**System tray on GNOME:** GNOME does not display tray icons by default. To use the tray icon feature (Settings → System → Show in System Tray), install the [AppIndicator and KStatusNotifierItem Support](https://extensions.gnome.org/extension/615/appindicator-support/) extension, then log out and back in. On Fedora: `sudo dnf install gnome-shell-extension-appindicator`. On Debian/Ubuntu it is pre-installed. Other desktop environments (KDE Plasma, XFCE, Cinnamon, MATE) support tray icons natively with no extra steps.
-
-### Homebrew (macOS)
-
-```sh
-brew install --cask pomotroid
-```
-
-> The Homebrew cask is maintained separately and may lag behind the latest release. Check the [releases](https://github.com/Splode/pomotroid/releases) page for the most current version.
-
-## Custom Themes
-
-Pomotroid supports user-created themes with automatic hot-reload — no restart required. See [THEMES.md](./THEMES.md) for directory paths, the full color reference, and a step-by-step guide.
+可在「设置 → 外观」选择浅色、深色或跟随系统，并分别设置两种模式的主题。把自定义 JSON 文件放到应用数据目录的 `themes/` 文件夹即可加载，修改时无需重启。[自定义主题指南](./THEMES.md)
 
 ## WebSocket API
 
-Pomotroid exposes an optional WebSocket server (disabled by default) for integration with external tools, stream overlays, and automation scripts.
+本地 WebSocket 服务默认为关闭。开启「设置 → 系统 → 集成 → WebSocket 服务器」后，可用 `ws://127.0.0.1:1314/ws` 连接计时器，适用于直播叠层或本地脚本。修改端口后用设置中的端口连接。
 
-**Enable it** in Settings → Advanced → WebSocket Server, then connect to `ws://127.0.0.1:<port>` (default port: 1314).
+发送 `{"type":"getState"}` 可查询当前计时状态。服务端消息如下。
 
-### Messages
+| `type`              | `payload`               | 触发时机        |
+| ------------------- | ----------------------- | --------------- |
+| `state`             | 计时器状态              | 响应 `getState` |
+| `roundChange`       | 计时器状态              | 切换轮次        |
+| `started`           | `{ "total_secs": … }`   | 轮次开始        |
+| `paused`、`resumed` | `{ "elapsed_secs": … }` | 暂停或继续      |
+| `reset`             | —                       | 重置计时器      |
 
-**Client → Server**
+计时器状态包括 `round_type`、`previous_round_type`、`elapsed_secs`、`total_secs`、`is_running`、`is_paused`、`work_round_number`、`work_rounds_total` 和 `session_work_count`。[协议实现](./src-tauri/src/websocket/mod.rs)
 
-| Message                  | Description                     |
-| ------------------------ | ------------------------------- |
-| `{ "type": "getState" }` | Request the current timer state |
+## 从源码构建
 
-**Server → Client**
+小番茄使用 Tauri 2、Rust 和 Svelte 5。在 Windows x64 上需要 Node.js 22.12 或更高版本、npm、Rust 稳定版的 x64 MSVC 工具链、Microsoft C++ Build Tools（选择「使用 C++ 的桌面开发」）和 Microsoft Edge WebView2 Runtime。[Tauri 的 Windows 环境说明](https://v2.tauri.app/start/prerequisites/#windows)
 
-| Event         | Payload             | Description                                      |
-| ------------- | ------------------- | ------------------------------------------------ |
-| `state`       | `TimerState` object | Response to `getState`                           |
-| `roundChange` | `TimerState` object | Fired whenever the timer advances to a new round |
-| `error`       | `{ message }`       | Protocol error                                   |
-
-`TimerState` fields: `elapsed_secs`, `total_secs`, `is_running`, `is_paused`, `round_type`, `work_round_number`, `work_rounds_total`.
-
-## Development
-
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for full setup instructions, project structure, and the release process.
-
-### Quick start
-
-```bash
-# Install dependencies
+```powershell
+git clone https://github.com/codinglemom/pomotroid.git
+cd pomotroid
 npm install
-
-# Run in development mode (hot-reload)
 npm run tauri dev
-
-# Build a production release
-npm run tauri build
 ```
 
-### Localization
+在项目根目录运行下列命令生成 NSIS 安装包。
 
-UI strings live in `src/messages/<locale>.json` (en, es, fr, de, ja, zh, pt, tr). The compiled output in `src/paraglide/` is generated at build time and is not committed to the repository.
-
-**During development**, the Paraglide Vite plugin compiles messages automatically whenever `npm run tauri dev` or `npm run tauri build` is run — no manual step required.
-
-**After adding or changing message keys**, regenerate the output explicitly so that `svelte-check` and your editor can pick up the new types:
-
-```bash
-npm run paraglide:compile
+```powershell
+npm run tauri build -- --bundles nsis
 ```
 
-This is also run automatically as part of `npm run check`.
+安装包位于 `src-tauri/target/release/bundle/nsis/`。开发时可用 `npm run check` 检查 Svelte 与 TypeScript，用 `cargo test --manifest-path src-tauri/Cargo.toml` 运行 Rust 测试。
 
-## License
+## 参与贡献
 
-MIT &copy; [Christopher Murphy](https://github.com/Splode)
+小番茄的改动请向本 Fork 的 `main` 分支提交 Pull Request。项目结构、检查命令、主题和翻译的维护方式见[贡献指南](./CONTRIBUTING.md)。
+
+## 许可证
+
+项目采用 MIT 许可证。原始项目由 Christopher Murphy（Splode）创建。[MIT 许可证全文](./LICENSE)

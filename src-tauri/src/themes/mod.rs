@@ -38,6 +38,8 @@ const BUNDLED_JSON: &[&str] = &[
     include_str!("../../../static/themes/darcula.json"),
     include_str!("../../../static/themes/dva.json"),
     include_str!("../../../static/themes/everforest.json"),
+    include_str!("../../../static/themes/fluent-calm-light.json"),
+    include_str!("../../../static/themes/fluent-calm-dark.json"),
     include_str!("../../../static/themes/github.json"),
     include_str!("../../../static/themes/github-dark.json"),
     include_str!("../../../static/themes/graphite.json"),
@@ -168,7 +170,7 @@ mod tests {
     #[test]
     fn all_bundled_themes_parse() {
         let themes = load_bundled();
-        assert_eq!(themes.len(), 38, "expected 38 bundled themes");
+        assert_eq!(themes.len(), 40, "expected 40 bundled themes");
     }
 
     #[test]
@@ -209,5 +211,42 @@ mod tests {
             themes.iter().any(|t| t.name == "Crimson White"),
             "Crimson White theme must be bundled"
         );
+    }
+
+    #[test]
+    fn fluent_calm_themes_have_the_approved_palette() {
+        let themes = load_bundled();
+        let keys = [
+            "--color-background",
+            "--color-background-light",
+            "--color-foreground",
+            "--color-foreground-darker",
+            "--color-accent",
+            "--color-focus-round",
+            "--color-short-round",
+            "--color-long-round",
+        ];
+        for (name, colors) in [
+            (
+                "Fluent Calm Light",
+                [
+                    "#F5F5F2", "#FFFFFF", "#252C27", "#505D55", "#B44F40", "#B44F40", "#44745B",
+                    "#496C96",
+                ],
+            ),
+            (
+                "Fluent Calm Dark",
+                [
+                    "#202321", "#292D2A", "#F0F2ED", "#C2CCC3", "#F0A08E", "#F0A08E", "#9BC9AB",
+                    "#A2BDDF",
+                ],
+            ),
+        ] {
+            let theme = themes.iter().find(|theme| theme.name == name).unwrap();
+            assert!(!theme.is_custom);
+            for (key, color) in keys.iter().zip(colors) {
+                assert_eq!(theme.colors[*key], color, "{name}: {key}");
+            }
+        }
     }
 }

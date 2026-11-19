@@ -3,13 +3,13 @@
 /// Commands are grouped by domain: Timer, Settings, Themes, Stats.
 /// Each command returns `Result<T, String>` so errors surface cleanly in JS.
 use log::LevelFilter;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 
 use std::sync::Arc;
 
-use crate::audio::{self, AudioManager};
+use crate::audio::{AlertSounds, AudioManager, CustomAudioInfo};
 use crate::notifications;
-use crate::db::{queries, DbState};
+use crate::db::{queries, wallet, DbState};
 use crate::settings::{self, Settings};
 use crate::shortcuts;
 use crate::themes::{self, Theme};
@@ -82,6 +82,15 @@ pub fn settings_set(
     ws_state: State<'_, Arc<WsState>>,
     app: AppHandle,
 ) -> Result<Settings, String> {
+    if key == wallet::RATE_KEY {
+        return Err("Use wallet_set_rate to change the reward rate".into());
+    }
+    if key == "acrylic_transparency" {
+        settings::validate_acrylic_transparency(&value)?;
+    }
+    if key == "timer_style" {
+        value.parse::<settings::TimerStyle>()?;
+    }
     log::debug!("[settings] set {key}={value}");
     let new_settings = {
         let conn = db.lock().map_err(|e| e.to_string())?;
@@ -101,6 +110,11 @@ pub fn settings_set(
             e.to_string()
         })?
     };
+
+    if key == "timer_style" {
+        app.emit("settings:changed", &new_settings).ok();
+        return Ok(new_settings);
+    }
 
     // Apply verbose_logging change immediately without a restart.
     if key == "verbose_logging" {
@@ -238,16 +252,25 @@ pub fn settings_reset_defaults(
     db: State<'_, DbState>,
     timer: State<'_, TimerController>,
     tray_state: State<'_, Arc<TrayState>>,
+    audio: State<'_, Arc<AudioManager>>,
     app: AppHandle,
 ) -> Result<Settings, String> {
     log::info!("[settings] reset to defaults");
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let new_settings = {
-        let conn = db.lock().map_err(|e| e.to_string())?;
+        let mut conn = db.lock().map_err(|e| e.to_string())?;
+        let mut alerts = audio.alerts.lock().map_err(|e| e.to_string())?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
         // Delete all rows so seed_defaults can insert fresh defaults.
-        conn.execute("DELETE FROM settings", [])
+        tx.execute("DELETE FROM settings", [])
             .map_err(|e| e.to_string())?;
-        settings::seed_defaults(&conn).map_err(|e| e.to_string())?;
-        settings::load(&conn).map_err(|e| e.to_string())?
+        settings::seed_defaults(&tx).map_err(|e| e.to_string())?;
+        AlertSounds::save_classic_presets(&tx).map_err(|e| e.to_string())?;
+        let new_settings = settings::load(&tx).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        alerts.reset(&data_dir.join("audio"));
+        audio.apply_settings(&new_settings);
+        new_settings
     };
 
     timer.apply_settings(new_settings.clone());
@@ -265,27 +288,6 @@ pub fn settings_reset_defaults(
     // After reset, defaults have tray_icon_enabled=false and min_to_tray=false,
     // so destroy any active tray icon.
     tray::destroy_tray(&tray_state);
-
-    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-
-    // Clear custom alert sounds: delete files from disk and reset in-memory paths.
-    if let Some(audio_state) = app.try_state::<Arc<AudioManager>>() {
-        let audio_dir = data_dir.join("audio");
-        for stem in [audio::STEM_WORK, audio::STEM_SHORT, audio::STEM_LONG] {
-            if let Ok(entries) = std::fs::read_dir(&audio_dir) {
-                for entry in entries.filter_map(|e| e.ok()) {
-                    let p = entry.path();
-                    if p.file_stem().and_then(|s| s.to_str()) == Some(stem) {
-                        let _ = std::fs::remove_file(&p);
-                    }
-                }
-            }
-        }
-        audio_state.clear_custom_path("work_alert");
-        audio_state.clear_custom_path("short_break_alert");
-        audio_state.clear_custom_path("long_break_alert");
-        log::info!("[audio] custom sounds cleared on settings reset");
-    }
 
     let tray_theme_name = match new_settings.theme_mode.as_str() {
         "dark" => &new_settings.theme_dark,
@@ -317,18 +319,68 @@ pub fn themes_list(app: AppHandle) -> Result<Vec<Theme>, String> {
 // CMD-04 — Sessions commands
 // ---------------------------------------------------------------------------
 
-/// Deletes all rows from the `sessions` table (irreversible bulk clear).
+/// Deletes session history, retaining the active round until it can settle.
 /// Emits `sessions:cleared` so any open stats window can refresh immediately.
 #[tauri::command]
-pub fn sessions_clear(db: State<'_, DbState>, app: AppHandle) -> Result<(), String> {
+pub fn sessions_clear(
+    db: State<'_, DbState>,
+    timer: State<'_, TimerController>,
+    app: AppHandle,
+) -> Result<(), String> {
     log::info!("[sessions] clearing all session history");
     let conn = db.lock().map_err(|e| e.to_string())?;
-    let n = conn.execute("DELETE FROM sessions", []).map_err(|e| {
+    // Session creation publishes its ID under this same database lock.
+    let n = queries::clear_session_history(&conn, timer.active_session_id()).map_err(|e| {
         log::error!("[sessions] failed to clear history: {e}");
         e.to_string()
     })?;
     log::info!("[sessions] cleared {n} rows");
     app.emit("sessions:cleared", ()).ok();
+    Ok(())
+}
+
+// Reward wallet commands use their own setting to avoid reconfiguring the timer.
+#[tauri::command]
+pub fn wallet_get_summary(db: State<'_, DbState>) -> Result<wallet::WalletSummary, String> {
+    let conn = db.lock().map_err(|e| e.to_string())?;
+    wallet::summary(&conn).inspect_err(|e| log::error!("[wallet] summary failed: {e}"))
+}
+
+#[tauri::command]
+pub fn wallet_get_income_history(
+    db: State<'_, DbState>,
+    days: u32,
+) -> Result<wallet::WalletIncomeHistory, String> {
+    let conn = db.lock().map_err(|e| e.to_string())?;
+    wallet::income_history(&conn, days)
+        .inspect_err(|e| log::error!("[wallet] income history failed: {e}"))
+}
+
+#[tauri::command]
+pub fn wallet_get_ledger(db: State<'_, DbState>, before_id: Option<i64>) -> Result<wallet::LedgerPage, String> {
+    let conn = db.lock().map_err(|e| e.to_string())?;
+    wallet::ledger(&conn, before_id).inspect_err(|e| log::error!("[wallet] ledger failed: {e}"))
+}
+
+#[tauri::command]
+pub fn wallet_set_rate(db: State<'_, DbState>, app: AppHandle, rate_minor_per_hour: i64) -> Result<(), String> {
+    {
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        wallet::set_rate(&conn, rate_minor_per_hour).inspect_err(|e| log::error!("[wallet] rate update failed: {e}"))?;
+    }
+    log::info!("[wallet] hourly rate updated to {rate_minor_per_hour} minor units");
+    app.emit("wallet:changed", ()).ok();
+    Ok(())
+}
+
+#[tauri::command]
+pub fn wallet_spend(db: State<'_, DbState>, app: AppHandle, amount_minor: i64, note: String, request_id: String) -> Result<(), String> {
+    {
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        wallet::spend(&conn, amount_minor, &note, &request_id).inspect_err(|e| log::error!("[wallet] expense failed: {e}"))?;
+    }
+    log::info!("[wallet] expense committed: {amount_minor} minor units");
+    app.emit("wallet:changed", ()).ok();
     Ok(())
 }
 
@@ -384,164 +436,127 @@ pub fn stats_get_heatmap(db: State<'_, DbState>) -> Result<HeatmapStats, String>
 
 /// Show or hide the main window.
 #[tauri::command]
-pub fn window_set_visibility(visible: bool, app: AppHandle) -> Result<(), String> {
+pub async fn window_set_visibility(visible: bool, window: WebviewWindow) -> Result<(), String> {
+    require_window(&window, "main")?;
     log::debug!("[window] set visibility={visible}");
-    let window = app
-        .get_webview_window("main")
-        .ok_or_else(|| "main window not found".to_string())?;
-    if visible {
-        window.show().map_err(|e| e.to_string())?;
-        window.set_focus().map_err(|e| e.to_string())?;
-    } else {
-        window.hide().map_err(|e| e.to_string())?;
+    let app = window.app_handle().clone();
+    tauri::async_runtime::spawn_blocking(move || crate::windows::set_visibility(&app, visible))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn require_window(window: &WebviewWindow, label: &str) -> Result<(), String> {
+    if window.label() != label {
+        return Err(format!("this command requires the {label} window"));
     }
     Ok(())
+}
+
+#[tauri::command]
+pub async fn window_open_widget(window: WebviewWindow) -> Result<(), String> {
+    require_window(&window, "main")?;
+    tauri::async_runtime::spawn_blocking(move || crate::windows::open_widget(&window))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn window_widget_ready(window: WebviewWindow) -> Result<(), String> {
+    require_window(&window, "widget")?;
+    tauri::async_runtime::spawn_blocking(move || crate::windows::widget_ready(&window))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn window_restore_main(window: WebviewWindow) -> Result<(), String> {
+    require_window(&window, "widget")?;
+    tauri::async_runtime::spawn_blocking(move || crate::windows::restore_main(&window))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub fn window_apply_material(
+    window: WebviewWindow,
+    theme_mode: String,
+    enabled: bool,
+) -> Result<bool, String> {
+    if window.label() == "widget" {
+        return Ok(false);
+    }
+    crate::windows::apply_material(&window, &theme_mode, enabled)
 }
 
 // ---------------------------------------------------------------------------
 // CMD-07 — Audio commands
 // ---------------------------------------------------------------------------
 
-/// Copy a user-selected audio file into the app config dir for the given cue slot.
-///
-/// `cue` must be one of: `"work_alert"`, `"short_break_alert"`, `"long_break_alert"`.
-/// `src_path` is the full path to the file chosen by the user.
-///
-/// The file is stored with a fixed stem (e.g. `custom_work_alert.mp3`) so that
-/// selecting a new file for the same slot automatically replaces the old one —
-/// no orphan files accumulate.
-///
-/// Returns the original filename for display in the UI.
+/// Import and select a custom sound. Return its original filename.
 #[tauri::command]
 pub fn audio_set_custom(
     cue: String,
     src_path: String,
     db: State<'_, DbState>,
+    audio: State<'_, Arc<AudioManager>>,
     app: AppHandle,
 ) -> Result<String, String> {
-    let audio_state = app
-        .try_state::<Arc<AudioManager>>()
-        .ok_or_else(|| "audio engine is not available".to_string())?;
-
-    let stem = cue_to_stem(&cue)?;
-
+    let cue = cue.parse()?;
     let audio_dir = app
         .path()
         .app_data_dir()
         .map_err(|e| e.to_string())?
         .join("audio");
-    std::fs::create_dir_all(&audio_dir).map_err(|e| e.to_string())?;
-
-    let src = std::path::Path::new(&src_path);
-    let ext = src
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("mp3");
-
-    // Remove any existing custom file for this slot (preserves zero orphans).
-    if let Ok(entries) = std::fs::read_dir(&audio_dir) {
-        for entry in entries.filter_map(|e| e.ok()) {
-            let p = entry.path();
-            if p.file_stem().and_then(|s| s.to_str()) == Some(stem) {
-                let _ = std::fs::remove_file(&p);
-            }
-        }
-    }
-
-    let dest = audio_dir.join(format!("{stem}.{ext}"));
-    std::fs::copy(src, &dest).map_err(|e| e.to_string())?;
-
-    // Verify the copied file is decodable before committing. If it fails,
-    // clean up the orphan and sync in-memory state to default (the old file
-    // was already deleted above).
-    if let Err(e) = audio::probe_audio_file(&dest) {
-        let _ = std::fs::remove_file(&dest);
-        audio_state.clear_custom_path(&cue);
-        return Err(e);
-    }
-
-    audio_state.set_custom_path(&cue, dest);
-
-    let display_name = src
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("custom")
-        .to_string();
-
-    // Persist the original filename so it survives restarts.
-    let name_key = cue_to_name_key(&cue)?;
-    let conn = db.lock().map_err(|e| e.to_string())?;
-    settings::save_setting(&conn, name_key, &display_name).map_err(|e| e.to_string())?;
-
-    log::info!("[audio] custom sound set cue={cue} file={display_name}");
-    Ok(display_name)
+    let mut conn = db.lock().map_err(|e| e.to_string())?;
+    let mut alerts = audio.alerts.lock().map_err(|e| e.to_string())?;
+    alerts.import(&mut conn, &audio_dir, cue, std::path::Path::new(&src_path))
 }
 
-/// Restore the built-in sound for the given cue slot by deleting the custom file.
+/// Delete a custom import and select the classic sound.
 #[tauri::command]
 pub fn audio_clear_custom(
     cue: String,
     db: State<'_, DbState>,
+    audio: State<'_, Arc<AudioManager>>,
     app: AppHandle,
 ) -> Result<(), String> {
-    let audio_state = app
-        .try_state::<Arc<AudioManager>>()
-        .ok_or_else(|| "audio engine is not available".to_string())?;
-
-    let stem = cue_to_stem(&cue)?;
-
+    let cue = cue.parse()?;
     let audio_dir = app
         .path()
         .app_data_dir()
         .map_err(|e| e.to_string())?
         .join("audio");
-
-    if let Ok(entries) = std::fs::read_dir(&audio_dir) {
-        for entry in entries.filter_map(|e| e.ok()) {
-            let p = entry.path();
-            if p.file_stem().and_then(|s| s.to_str()) == Some(stem) {
-                std::fs::remove_file(&p).map_err(|e| e.to_string())?;
-            }
-        }
-    }
-
-    audio_state.clear_custom_path(&cue);
-
-    // Remove the persisted display name.
-    let name_key = cue_to_name_key(&cue)?;
-    let conn = db.lock().map_err(|e| e.to_string())?;
-    conn.execute("DELETE FROM settings WHERE key = ?1", rusqlite::params![name_key])
-        .map_err(|e| e.to_string())?;
-
-    log::info!("[audio] custom sound cleared cue={cue}");
-    Ok(())
+    let mut conn = db.lock().map_err(|e| e.to_string())?;
+    let mut alerts = audio.alerts.lock().map_err(|e| e.to_string())?;
+    alerts.clear(&mut conn, &audio_dir, cue)
 }
 
-/// Return the display names of any currently configured custom audio files.
-/// Fields are `null` when the built-in sound is in use for that slot.
+/// Return the selected presets and file names of any retained custom imports.
 #[tauri::command]
 pub fn audio_get_custom_info(
+    audio: State<'_, Arc<AudioManager>>,
+) -> Result<CustomAudioInfo, String> {
+    let alerts = audio.alerts.lock().map_err(|e| e.to_string())?;
+    Ok(alerts.info())
+}
+
+#[tauri::command]
+pub fn audio_set_preset(
+    cue: String,
+    preset: String,
     db: State<'_, DbState>,
-    app: AppHandle,
-) -> Result<audio::CustomAudioInfo, String> {
-    let audio_state = app
-        .try_state::<Arc<AudioManager>>()
-        .ok_or_else(|| "audio engine is not available".to_string())?;
+    audio: State<'_, Arc<AudioManager>>,
+) -> Result<(), String> {
+    let cue = cue.parse()?;
+    let preset = preset.parse()?;
+    let mut conn = db.lock().map_err(|e| e.to_string())?;
+    let mut alerts = audio.alerts.lock().map_err(|e| e.to_string())?;
+    alerts.set_preset(&mut conn, cue, preset)
+}
 
-    // Start from the AudioManager's paths (determines which slots are active).
-    let mut info = audio_state.get_custom_info();
-
-    // Override each active slot's name with the persisted original filename.
-    let conn = db.lock().map_err(|e| e.to_string())?;
-    let override_name = |stored: &Option<String>, key: &str| -> Option<String> {
-        stored.as_ref()?; // slot not active — leave as None
-        settings::get_setting(&conn, key).or_else(|| stored.clone())
-    };
-    info.work_alert = override_name(&info.work_alert, "custom_work_alert_name");
-    info.short_break_alert = override_name(&info.short_break_alert, "custom_short_break_alert_name");
-    info.long_break_alert = override_name(&info.long_break_alert, "custom_long_break_alert_name");
-
-    Ok(info)
+#[tauri::command]
+pub async fn audio_preview(cue: String, audio: State<'_, Arc<AudioManager>>) -> Result<(), String> {
+    audio.preview(cue.parse()?).await
 }
 
 // ---------------------------------------------------------------------------
@@ -555,6 +570,18 @@ pub fn audio_get_custom_info(
 #[tauri::command]
 pub fn notification_show(title: String, body: String, app: AppHandle) {
     notifications::show(&app, &title, &body);
+}
+
+/// Keep the resolved auto locale available after all WebViews are destroyed.
+#[tauri::command]
+pub fn notification_set_locale(locale: String, state: State<'_, notifications::LocaleState>) {
+    state.set(&locale);
+}
+
+#[tauri::command]
+pub fn notification_test(db: State<'_, DbState>, app: AppHandle) -> Result<(), String> {
+    let settings = settings_get(db)?;
+    notifications::show_test(&app, &settings)
 }
 
 // ---------------------------------------------------------------------------
@@ -706,24 +733,6 @@ pub async fn install_update(app: AppHandle) -> Result<(), String> {
         })?;
     log::info!("[updater] install complete — relaunching");
     app.restart();
-}
-
-fn cue_to_stem(cue: &str) -> Result<&'static str, String> {
-    match cue {
-        "work_alert" => Ok(audio::STEM_WORK),
-        "short_break_alert" => Ok(audio::STEM_SHORT),
-        "long_break_alert" => Ok(audio::STEM_LONG),
-        _ => Err(format!("unknown audio cue: '{cue}'")),
-    }
-}
-
-fn cue_to_name_key(cue: &str) -> Result<&'static str, String> {
-    match cue {
-        "work_alert" => Ok("custom_work_alert_name"),
-        "short_break_alert" => Ok("custom_short_break_alert_name"),
-        "long_break_alert" => Ok("custom_long_break_alert_name"),
-        _ => Err(format!("unknown audio cue: '{cue}'")),
-    }
 }
 
 // ---------------------------------------------------------------------------

@@ -3269,6 +3269,8 @@ dependencies = [
  "tiny-skia",
  "tokio",
  "tokio-tungstenite",
+ "windows 0.61.3",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

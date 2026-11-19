@@ -90,6 +90,27 @@ const MIGRATION_6: &str = "
     INSERT INTO schema_version VALUES (6);
 ";
 
+// Ledger entries deliberately have no foreign key: clearing statistics must
+// preserve both the money and the source details of every reward.
+const MIGRATION_7: &str = "
+    ALTER TABLE sessions ADD COLUMN reward_rate_minor_per_hour INTEGER;
+    CREATE TABLE reward_ledger (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_session_id INTEGER UNIQUE,
+        request_id TEXT UNIQUE,
+        kind TEXT NOT NULL CHECK(kind IN ('income', 'expense')),
+        amount_minor INTEGER NOT NULL CHECK(
+            (kind = 'income' AND amount_minor >= 0) OR
+            (kind = 'expense' AND amount_minor < 0)),
+        created_at INTEGER NOT NULL,
+        note TEXT NOT NULL DEFAULT '',
+        duration_secs INTEGER,
+        rate_minor_per_hour INTEGER,
+        started_at INTEGER
+    );
+    INSERT INTO schema_version VALUES (7);
+";
+
 /// Apply any pending migrations. Each migration is wrapped in a transaction
 /// so a partial failure leaves the database unchanged.
 pub fn run(conn: &Connection) -> Result<()> {
@@ -131,6 +152,14 @@ pub fn run(conn: &Connection) -> Result<()> {
         log::info!("[db/migrations] MIGRATION_6 complete");
     }
 
+    if version < 7 {
+        log::info!("[db/migrations] applying MIGRATION_7: reward wallet");
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_7)?;
+        tx.commit()?;
+        log::info!("[db/migrations] MIGRATION_7 complete");
+    }
+
     Ok(())
 }
 
@@ -166,14 +195,14 @@ mod tests {
         let v: i64 = conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 6);
+        assert_eq!(v, 7);
     }
 
     #[test]
     fn all_tables_created() {
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();
-        for table in &["settings", "sessions", "custom_themes", "schema_version"] {
+        for table in &["settings", "sessions", "custom_themes", "schema_version", "reward_ledger"] {
             let count: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -183,5 +212,24 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 1, "table '{table}' was not created");
         }
+    }
+
+    #[test]
+    fn version_six_history_is_preserved_without_retroactive_rewards() {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in [MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute("INSERT INTO sessions (started_at, ended_at, round_type, duration_secs, completed) VALUES (100, 1600, 'work', 1500, 1)", []).unwrap();
+        conn.execute("INSERT INTO settings VALUES ('custom', 'preserved')", []).unwrap();
+        run(&conn).unwrap();
+        run(&conn).unwrap();
+        let history: (i64, i64, String, i64, i64, Option<i64>) = conn.query_row(
+            "SELECT started_at, ended_at, round_type, duration_secs, completed, reward_rate_minor_per_hour FROM sessions WHERE id=1",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        ).unwrap();
+        assert_eq!(history, (100, 1600, "work".into(), 1500, 1, None));
+        assert_eq!(conn.query_row("SELECT value FROM settings WHERE key='custom'", [], |r| r.get::<_, String>(0)).unwrap(), "preserved");
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM reward_ledger", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
     }
 }

@@ -1,9 +1,4 @@
-/// System tray management with dynamic arc icon via tiny-skia.
-///
-/// The tray icon is a 32×32 RGBA image:
-///   - Solid filled background circle in the theme's background color.
-///   - Progress arc from 12 o'clock sweeping clockwise, colored by round type.
-///   - While paused: two vertical bars drawn over the progress arc.
+/// System tray management with dynamic timer icons via tiny-skia.
 ///
 /// Colors come from the active theme, updated when theme changes.
 /// The tray is created/destroyed when `min_to_tray` setting changes.
@@ -15,18 +10,30 @@
 /// typically does not ship these libraries.  `create_tray` probes for them
 /// before calling `TrayIconBuilder::build()` and returns early with a warning
 /// when they are absent, preventing the abort.
-use std::f32::consts::{FRAC_PI_2, PI, TAU};
-use std::sync::{Arc, Mutex};
+use std::f32::consts::PI;
+#[cfg(not(target_os = "windows"))]
+use std::f32::consts::{FRAC_PI_2, TAU};
+use std::sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex};
 
 use tauri::{
     image::Image,
-    menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
     AppHandle, Manager,
 };
+#[cfg(not(target_os = "windows"))]
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 
 use crate::timer::TimerController;
-use tiny_skia::{Color, Paint, PathBuilder, Pixmap, Stroke, Transform};
+use tiny_skia::{Color, PathBuilder};
+#[cfg(not(target_os = "windows"))]
+use tiny_skia::{Paint, Pixmap, Stroke, Transform};
+
+#[cfg(target_os = "windows")]
+pub(crate) mod panel;
+#[cfg(target_os = "windows")]
+mod tomato;
+#[cfg(target_os = "windows")]
+pub use tomato::render_tray_icon_rgba;
 
 // ---------------------------------------------------------------------------
 // Theme colors for tray rendering
@@ -101,8 +108,16 @@ pub fn parse_hex_color(hex: &str) -> Option<[u8; 4]> {
 // Shared tray state
 // ---------------------------------------------------------------------------
 
+#[cfg(not(target_os = "windows"))]
+const MENU_START: &str = "▶  开始计时";
+#[cfg(not(target_os = "windows"))]
+const MENU_PAUSE: &str = "⏸  暂停计时";
+#[cfg(not(target_os = "windows"))]
+const MENU_RESUME: &str = "▶  继续计时";
+
 /// Handles to the dynamic timer-control menu items.
 /// Stored in `TrayState` so the timer event thread can update labels/enabled states.
+#[cfg(not(target_os = "windows"))]
 pub struct TrayMenuItems {
     pub toggle: MenuItem<tauri::Wry>,
     pub skip: MenuItem<tauri::Wry>,
@@ -112,8 +127,11 @@ pub struct TrayMenuItems {
 /// Tauri-managed state for the tray icon (uses the default Wry runtime).
 pub struct TrayState {
     pub icon: Mutex<Option<TrayIcon<tauri::Wry>>>,
+    /// True only after the OS icon was successfully created/shown.
+    pub available: AtomicBool,
     pub colors: Mutex<TrayColors>,
     pub countdown_mode: Mutex<bool>,
+    #[cfg(not(target_os = "windows"))]
     pub menu_items: Mutex<Option<TrayMenuItems>>,
 }
 
@@ -121,24 +139,12 @@ impl TrayState {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             icon: Mutex::new(None),
+            available: AtomicBool::new(false),
             colors: Mutex::new(TrayColors::default()),
             countdown_mode: Mutex::new(false),
+            #[cfg(not(target_os = "windows"))]
             menu_items: Mutex::new(None),
         })
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TrayWindowAction {
-    Hide,
-    Restore,
-}
-
-fn tray_window_action(is_visible: bool, is_minimized: bool) -> TrayWindowAction {
-    if is_visible && !is_minimized {
-        TrayWindowAction::Hide
-    } else {
-        TrayWindowAction::Restore
     }
 }
 
@@ -211,7 +217,7 @@ pub fn create_tray(app: &AppHandle, state: &Arc<TrayState>) {
     {
         let guard = state.icon.lock().unwrap();
         if let Some(existing) = guard.as_ref() {
-            let _ = existing.set_visible(true);
+            state.available.store(existing.set_visible(true).is_ok(), Ordering::Release);
             log::info!("[tray] shown (reused existing icon)");
             return;
         }
@@ -230,122 +236,114 @@ pub fn create_tray(app: &AppHandle, state: &Arc<TrayState>) {
         return;
     }
 
-    let toggle_item = match MenuItem::with_id(app, "toggle", "Start", true, None::<&str>) {
-        Ok(i) => i,
-        Err(e) => { log::warn!("[tray] menu item error: {e}"); return; }
-    };
-    let skip_item = match MenuItem::with_id(app, "skip", "Skip", false, None::<&str>) {
-        Ok(i) => i,
-        Err(e) => { log::warn!("[tray] menu item error: {e}"); return; }
-    };
-    let reset_item = match MenuItem::with_id(app, "reset-round", "Reset Round", false, None::<&str>) {
-        Ok(i) => i,
-        Err(e) => { log::warn!("[tray] menu item error: {e}"); return; }
-    };
-    let sep = match PredefinedMenuItem::separator(app) {
-        Ok(i) => i,
-        Err(e) => { log::warn!("[tray] menu item error: {e}"); return; }
-    };
-    let show_item = match MenuItem::with_id(app, "show", "Show", true, None::<&str>) {
-        Ok(i) => i,
-        Err(e) => { log::warn!("[tray] menu item error: {e}"); return; }
-    };
-    let exit_item = match MenuItem::with_id(app, "exit", "Exit", true, None::<&str>) {
-        Ok(i) => i,
-        Err(e) => { log::warn!("[tray] menu item error: {e}"); return; }
-    };
-    let menu = match Menu::with_items(app, &[&toggle_item, &skip_item, &reset_item, &sep, &show_item, &exit_item]) {
-        Ok(m) => m,
-        Err(e) => { log::warn!("[tray] menu error: {e}"); return; }
-    };
-
-    // Render the initial idle icon using the current state (respects countdown mode
-    // and theme colors already set before create_tray is called).
+    // The user can enable the tray halfway through a paused round.
     let image = {
+        let snap = app.state::<TimerController>().get_snapshot();
+        let progress = snap.elapsed_secs as f32 / snap.total_secs.max(1) as f32;
         let colors = state.colors.lock().unwrap().clone();
         let countdown = *state.countdown_mode.lock().unwrap();
-        let bytes = render_tray_icon_rgba(&colors, false, 0.0, "work", countdown);
+        let bytes = render_tray_icon_rgba(&colors, snap.is_paused, progress, &snap.round_type, countdown);
         Image::new_owned(bytes, SIZE, SIZE)
     };
 
-    let tray = TrayIconBuilder::new()
+    let builder = TrayIconBuilder::new()
         .icon(image)
-        .tooltip("Pomotroid")
-        .menu(&menu)
+        .tooltip("小番茄 · 专注计时")
         .show_menu_on_left_click(false)
-        .on_tray_icon_event(|tray_icon, event| {
-            // Left-click: toggle window visibility.
-            if let TrayIconEvent::Click {
+        .on_tray_icon_event(|tray_icon, event| match event {
+            TrayIconEvent::Click {
                 button: MouseButton::Left,
                 button_state: MouseButtonState::Up,
                 ..
-            } = event
-            {
-                let app = tray_icon.app_handle();
-                if let Some(window) = app.get_webview_window("main") {
-                    let visible = window.is_visible().unwrap_or(false);
-                    let minimized = window.is_minimized().unwrap_or(false);
-                    match tray_window_action(visible, minimized) {
-                        TrayWindowAction::Hide => {
-                            log::debug!("[tray] left-click → hide");
-                            let _ = window.hide();
-                        }
-                        TrayWindowAction::Restore => {
-                            log::debug!("[tray] left-click → show");
-                            let _ = window.show();
-                            let _ = window.unminimize();
-                            let _ = window.set_focus();
-                        }
-                    }
-                }
+            } => {
+                #[cfg(target_os = "windows")]
+                panel::dismiss(tray_icon.app_handle());
+                crate::windows::toggle_from_tray(tray_icon.app_handle());
             }
-        })
-        .on_menu_event(|app, event| {
-            match event.id().as_ref() {
-                "toggle" => {
-                    if let Some(timer) = app.try_state::<TimerController>() {
-                        timer.toggle();
-                    }
-                }
-                "skip" => {
-                    if let Some(timer) = app.try_state::<TimerController>() {
-                        timer.skip();
-                    }
-                }
-                "reset-round" => {
-                    if let Some(timer) = app.try_state::<TimerController>() {
-                        timer.restart_round();
-                    }
-                }
-                "show" => {
-                    log::info!("[tray] show");
-                    if let Some(window) = app.get_webview_window("main") {
-                        let _ = window.show();
-                        let _ = window.unminimize();
-                        let _ = window.set_focus();
-                    }
-                }
-                "exit" => {
-                    log::info!("[tray] exit");
-                    app.exit(0);
-                }
-                _ => {}
+            // tray-icon maps WM_RBUTTONUP to Up; Tauri's enum docs swap the labels.
+            #[cfg(target_os = "windows")]
+            TrayIconEvent::Click {
+                button: MouseButton::Right,
+                button_state: MouseButtonState::Up,
+                rect,
+                ..
+            } => {
+                panel::open(tray_icon.app_handle(), rect);
             }
-        })
-        .build(app);
+            _ => {}
+        });
 
-    match tray {
+    #[cfg(not(target_os = "windows"))]
+    let (builder, menu_items) = match attach_native_menu(app, builder) {
+        Ok(menu) => menu,
+        Err(error) => {
+            log::warn!("[tray] failed to build tray menu: {error}");
+            return;
+        }
+    };
+
+    match builder.build(app) {
         Ok(t) => {
             *state.icon.lock().unwrap() = Some(t);
-            *state.menu_items.lock().unwrap() = Some(TrayMenuItems {
-                toggle: toggle_item,
-                skip: skip_item,
-                reset_round: reset_item,
-            });
+            state.available.store(true, Ordering::Release);
+            #[cfg(not(target_os = "windows"))]
+            {
+                *state.menu_items.lock().unwrap() = Some(menu_items);
+            }
             log::info!("[tray] created");
         }
         Err(e) => log::warn!("[tray] failed to build tray icon: {e}"),
     }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn attach_native_menu(
+    app: &AppHandle,
+    builder: TrayIconBuilder<tauri::Wry>,
+) -> tauri::Result<(TrayIconBuilder<tauri::Wry>, TrayMenuItems)> {
+    let toggle = MenuItem::with_id(app, "toggle", MENU_START, true, None::<&str>)?;
+    let skip = MenuItem::with_id(app, "skip", "⏭  跳过本轮", false, None::<&str>)?;
+    let reset_round = MenuItem::with_id(app, "reset-round", "↻  重置本轮", false, None::<&str>)?;
+    let separator = PredefinedMenuItem::separator(app)?;
+    let show = MenuItem::with_id(app, "show", "▣  打开主界面", true, None::<&str>)?;
+    let exit_separator = PredefinedMenuItem::separator(app)?;
+    let exit = MenuItem::with_id(app, "exit", "×  退出程序", true, None::<&str>)?;
+    let menu = Menu::with_items(
+        app,
+        &[&toggle, &skip, &reset_round, &separator, &show, &exit_separator, &exit],
+    )?;
+    let builder = builder.menu(&menu).on_menu_event(|app, event| {
+        match event.id().as_ref() {
+            "toggle" => {
+                if let Some(timer) = app.try_state::<TimerController>() {
+                    timer.toggle();
+                }
+            }
+            "skip" => {
+                if let Some(timer) = app.try_state::<TimerController>() {
+                    timer.skip();
+                }
+            }
+            "reset-round" => {
+                if let Some(timer) = app.try_state::<TimerController>() {
+                    timer.restart_round();
+                }
+            }
+            "show" => {
+                log::info!("[tray] show");
+                crate::windows::request_show(app);
+            }
+            "exit" => {
+                log::info!("[tray] exit");
+                app.exit(0);
+            }
+            _ => {}
+        }
+    });
+    Ok((
+        builder,
+        TrayMenuItems { toggle, skip, reset_round },
+    ))
 }
 
 /// Hide the system tray icon.
@@ -354,8 +352,11 @@ pub fn create_tray(app: &AppHandle, state: &Arc<TrayState>) {
 /// allocating a second OS icon.  Dropping the handle is not sufficient to
 /// remove the icon on all platforms; `set_visible(false)` is the reliable path.
 pub fn destroy_tray(state: &Arc<TrayState>) {
+    state.available.store(false, Ordering::Release);
     let guard = state.icon.lock().unwrap();
     if let Some(existing) = guard.as_ref() {
+        #[cfg(target_os = "windows")]
+        panel::dismiss(existing.app_handle());
         let _ = existing.set_visible(false);
         log::info!("[tray] hidden");
     }
@@ -392,17 +393,21 @@ pub fn update_icon(state: &Arc<TrayState>, round_type: &str, paused: bool, progr
 /// - `is_paused`: timer has been started and then paused (elapsed > 0, not running).
 ///
 /// No-op when the tray menu has not been created yet.
+#[cfg(not(target_os = "windows"))]
 pub fn update_menu_items(state: &Arc<TrayState>, is_running: bool, is_paused: bool) {
     let guard = state.menu_items.lock().unwrap();
     let Some(items) = guard.as_ref() else { return };
 
-    let toggle_label = if is_running { "Pause" } else if is_paused { "Resume" } else { "Start" };
+    let toggle_label = if is_running { MENU_PAUSE } else if is_paused { MENU_RESUME } else { MENU_START };
     let controls_enabled = is_running || is_paused;
 
     let _ = items.toggle.set_text(toggle_label);
     let _ = items.skip.set_enabled(controls_enabled);
     let _ = items.reset_round.set_enabled(controls_enabled);
 }
+
+#[cfg(target_os = "windows")]
+pub fn update_menu_items(_state: &Arc<TrayState>, _is_running: bool, _is_paused: bool) {}
 
 // ---------------------------------------------------------------------------
 // Icon rendering (tiny-skia)
@@ -413,10 +418,13 @@ pub fn update_menu_items(state: &Arc<TrayState>, is_running: bool, is_paused: bo
 // density displays; the larger source means the circle stays clean either way.
 const SIZE: u32 = 64;
 const CENTER: f32 = SIZE as f32 / 2.0;
+#[cfg(not(target_os = "windows"))]
 const RADIUS: f32 = CENTER - 5.0; // 5 px margin keeps the stroke inside the canvas
+#[cfg(not(target_os = "windows"))]
 const STROKE_WIDTH: f32 = 6.0;
 // Track opacity: the "empty" part of the ring at this brightness on a dark panel.
 // 22% white on #1a1a1a ≈ #383838 — invisible. 65% ≈ #a6a6a6 — clearly visible.
+#[cfg(not(target_os = "windows"))]
 const TRACK_ALPHA: u8 = 165; // ≈ 65 %
 
 fn rgba_color(c: [u8; 4]) -> Color {
@@ -428,6 +436,7 @@ fn rgba_color(c: [u8; 4]) -> Color {
 /// Using a ring (stroke-only circle) on a transparent background means the
 /// icon reads as a clear circle regardless of panel colour or scale factor,
 /// unlike a solid filled disc which looks like a dark blob at small sizes.
+#[cfg(not(target_os = "windows"))]
 pub fn render_tray_icon_rgba(
     colors: &TrayColors,
     paused: bool,
@@ -587,18 +596,4 @@ mod tests {
         assert_eq!(parse_hex_color(""), None);
     }
 
-    #[test]
-    fn tray_click_hides_visible_unminimized_window() {
-        assert_eq!(tray_window_action(true, false), TrayWindowAction::Hide);
-    }
-
-    #[test]
-    fn tray_click_restores_minimized_window() {
-        assert_eq!(tray_window_action(true, true), TrayWindowAction::Restore);
-    }
-
-    #[test]
-    fn tray_click_restores_hidden_window() {
-        assert_eq!(tray_window_action(false, false), TrayWindowAction::Restore);
-    }
 }

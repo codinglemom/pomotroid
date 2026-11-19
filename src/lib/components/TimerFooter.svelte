@@ -1,18 +1,10 @@
 <script lang="ts">
   // Round counter, reset/skip buttons, and volume slider.
-  import type { TimerState } from '$lib/types';
   import { timerReset, setSetting } from '$lib/ipc';
   import { settings } from '$lib/stores/settings';
   import * as m from '$paraglide/messages.js';
   import Tooltip from './Tooltip.svelte';
-
-  interface Props {
-    snap: TimerState;
-  }
-
-  let { snap }: Props = $props();
-
-  let showVolume = $state(false);
+  import Icon from './Icon.svelte';
 
   // Local volume for immediate slider feedback — avoids waiting for the
   // async IPC round-trip before the thumb visually moves.
@@ -44,172 +36,68 @@
   }
 </script>
 
-<!-- Round counter: X/Y when long breaks are active; labelled session count otherwise -->
-<Tooltip
-  text={$settings.long_breaks_enabled
-    ? m.tooltip_round_counter()
-    : m.tooltip_round_counter_session()}
->
-  <span class="rounds">
-    {#if $settings.long_breaks_enabled}
-      {snap.work_round_number} &nbsp;|&nbsp; {snap.work_rounds_total}
-    {:else}
-      {m.timer_session_round({ n: snap.session_work_count })}
-    {/if}
-  </span>
-</Tooltip>
-
-<!-- Reset -->
-<Tooltip text={m.tooltip_reset()}>
-  <button class="btn-text" onclick={timerReset} aria-label={m.timer_reset()}>
-    {m.timer_reset()}
-  </button>
-</Tooltip>
-
-<!-- Volume -->
-<!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="volume-wrapper">
-  <Tooltip text={localVolume === 0 ? m.tooltip_unmute() : m.tooltip_mute()}>
-    <button
-      class="btn-icon"
-      onclick={toggleMute}
-      aria-label={localVolume === 0 ? 'Unmute' : 'Mute'}
-      onmouseenter={() => (showVolume = true)}
-      onmouseleave={() => (showVolume = false)}
+<div class="timer-footer">
+  <Tooltip text={m.tooltip_reset()}>
+    <button class="reset" onclick={timerReset}
+      ><Icon name="reset" size={15} />{m.timer_reset()}</button
     >
-      {#if localVolume === 0}
-        <svg width="16" height="16" viewBox="0 0 16 16">
-          <polygon points="1,5 5,5 10,1 10,15 5,11 1,11" fill="currentColor" />
-          <line
-            x1="12"
-            y1="5"
-            x2="16"
-            y2="11"
-            stroke="currentColor"
-            stroke-width="1.5"
-            stroke-linecap="round"
-          />
-          <line
-            x1="16"
-            y1="5"
-            x2="12"
-            y2="11"
-            stroke="currentColor"
-            stroke-width="1.5"
-            stroke-linecap="round"
-          />
-        </svg>
-      {:else}
-        <svg width="16" height="16" viewBox="0 0 16 16">
-          <polygon points="1,5 5,5 10,1 10,15 5,11 1,11" fill="currentColor" />
-          <path
-            d="M12,5 Q15,8 12,11"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.5"
-            stroke-linecap="round"
-          />
-        </svg>
-      {/if}
-    </button>
   </Tooltip>
-
-  {#if showVolume}
-    <div class="volume-slider-wrapper">
-      <input
-        type="range"
-        min="0"
-        max="1"
-        step="0.01"
-        value={localVolume}
-        oninput={handleVolumeChange}
-        class="volume-slider"
-        aria-label="Volume"
-      />
-    </div>
-  {/if}
+  <div class="volume">
+    <Tooltip text={localVolume === 0 ? m.tooltip_unmute() : m.tooltip_mute()}>
+      <button
+        class="ui-button ui-icon-button"
+        onclick={toggleMute}
+        aria-label={localVolume === 0 ? m.tooltip_unmute() : m.tooltip_mute()}
+        aria-pressed={localVolume === 0}
+        ><Icon name={localVolume === 0 ? 'muted' : 'volume'} size={16} /></button
+      >
+    </Tooltip>
+    <input
+      type="range"
+      min="0"
+      max="1"
+      step="0.01"
+      value={localVolume}
+      oninput={handleVolumeChange}
+      aria-label={m.ui_volume()}
+    />
+  </div>
 </div>
 
 <style>
-  .rounds {
-    font-size: 0.8rem;
-    color: var(--color-foreground-darker, var(--color-foreground));
-    min-width: 48px;
-    text-align: center;
-    cursor: default;
-  }
-
-  .btn-text {
-    background: none;
-    border: none;
-    cursor: pointer;
-    color: var(--color-foreground-darker, var(--color-foreground));
-    font-size: 0.8rem;
-    padding: 4px 8px;
-    border-radius: 4px;
-    transition:
-      color 0.15s,
-      background 0.15s;
-  }
-
-  .btn-text:hover {
-    color: var(--color-foreground);
-    background: var(--color-hover);
-  }
-
-  .btn-icon {
-    background: none;
-    border: none;
-    cursor: pointer;
-    color: var(--color-foreground-darker, var(--color-foreground));
+  .timer-footer {
+    width: 280px;
     display: flex;
     align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    border-radius: 4px;
-    transition:
-      color 0.15s,
-      background 0.15s;
+    justify-content: space-between;
+    margin-top: 16px;
+    color: var(--color-foreground-darker);
   }
-
-  .btn-icon:hover {
-    color: var(--color-foreground);
-    background: var(--color-hover);
-  }
-
-  .volume-wrapper {
-    position: relative;
+  .reset {
     display: flex;
     align-items: center;
-    justify-content: center;
-  }
-
-  .volume-slider-wrapper {
-    position: absolute;
-    bottom: 100%;
-    left: 50%;
-    transform: translateX(-50%);
-    padding: 8px;
-    background: var(--color-background-light);
+    gap: 6px;
+    min-height: 32px;
+    padding: 4px 6px;
+    font-size: 12px;
+    border: 0;
     border-radius: 6px;
+    color: inherit;
+    background: transparent;
+    cursor: pointer;
+  }
+  .reset:hover {
+    background: var(--color-hover);
+  }
+  .volume {
     display: flex;
     align-items: center;
-    justify-content: center;
-    z-index: 10;
-    /* Fixed size to contain the rotated slider without layout overflow. */
-    width: 36px;
-    height: 100px;
+    gap: 4px;
   }
-
-  .volume-slider {
-    /* Rotate a normal horizontal slider so it appears vertical.
-       Unlike writing-mode, transform preserves correct pointer-event
-       mapping on WebKit: dragging up increases value, dragging down
-       decreases it. */
-    width: 80px;
-    transform: rotate(-90deg);
-    cursor: pointer;
+  input {
+    width: 78px;
+    height: 24px;
     accent-color: var(--color-accent);
+    cursor: pointer;
   }
 </style>
