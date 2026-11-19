@@ -12,11 +12,21 @@ pub fn insert_session(
     round_type: &str,
     duration_secs: u32,
 ) -> Result<i64> {
+    insert_session_with_reward_rate(conn, round_type, duration_secs, None)
+}
+
+/// The rate is captured at Started, before the first tick or any rate edit.
+pub fn insert_session_with_reward_rate(
+    conn: &Connection,
+    round_type: &str,
+    duration_secs: u32,
+    reward_rate_minor_per_hour: Option<i64>,
+) -> Result<i64> {
     let started_at = unix_now();
     conn.execute(
-        "INSERT INTO sessions (started_at, round_type, duration_secs, completed)
-         VALUES (?1, ?2, ?3, 0)",
-        params![started_at, round_type, duration_secs],
+        "INSERT INTO sessions (started_at, round_type, duration_secs, completed, reward_rate_minor_per_hour)
+         VALUES (?1, ?2, ?3, 0, ?4)",
+        params![started_at, round_type, duration_secs, reward_rate_minor_per_hour],
     )?;
     let id = conn.last_insert_rowid();
     log::debug!("[db] session started: id={id} type={round_type} duration={duration_secs}s");
@@ -28,18 +38,23 @@ pub fn complete_session(
     conn: &Connection,
     session_id: i64,
     completed: bool,
-) -> Result<()> {
-    conn.execute(
-        "UPDATE sessions SET ended_at = ?1, completed = ?2 WHERE id = ?3",
-        params![unix_now(), completed as i64, session_id],
-    )?;
-    log::debug!("[db] session ended: id={session_id} completed={completed}");
-    Ok(())
+) -> std::result::Result<bool, String> {
+    super::wallet::complete_session(conn, session_id, completed)
 }
 
 // ---------------------------------------------------------------------------
 // Stats queries
 // ---------------------------------------------------------------------------
+
+/// Clear history while retaining an in-progress round's settlement record.
+pub fn clear_session_history(conn: &Connection, active_id: Option<i64>) -> Result<usize> {
+    conn.execute(
+        "DELETE FROM sessions WHERE NOT (
+            id = COALESCE(?1, -1) AND ended_at IS NULL AND completed = 0
+        )",
+        [active_id],
+    )
+}
 
 #[derive(Debug, Serialize)]
 pub struct SessionStats {
@@ -289,7 +304,7 @@ pub fn compute_streak(days: &[String], today: &str) -> StreakInfo {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn unix_now() -> i64 {
+pub(super) fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

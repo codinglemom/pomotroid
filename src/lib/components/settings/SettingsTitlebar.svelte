@@ -9,10 +9,10 @@
 </script>
 
 <nav class="titlebar" class:macos={isMac} data-tauri-drag-region>
-  <h1 class="title">{m.settings_title()}</h1>
+  <h1 class="title">小番茄 · {m.settings_title()}</h1>
   <!-- Hidden on macOS; the native traffic light close button handles this. -->
   {#if !isMac}
-    <button class="btn-close" onclick={close} aria-label="Close">
+    <button class="btn-close" onclick={close} aria-label={m.ui_close()}>
       <svg width="12" height="12" viewBox="0 0 12 12">
         <line
           x1="1"
@@ -43,46 +43,36 @@
     width: 100%;
     display: flex;
     align-items: center;
-    justify-content: center;
     position: relative;
     flex-shrink: 0;
     border-bottom: 1px solid var(--color-separator);
+    padding: 0 16px;
+    background: var(--surface-sidebar);
   }
-
-  /* Shift the centered title right of the traffic lights on macOS. */
   .macos {
-    padding-left: 72px;
+    padding-left: 76px;
   }
-
   .title {
-    font-size: 0.8rem;
-    font-weight: 600;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: var(--color-foreground-darker, var(--color-foreground));
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--color-foreground-darker);
     pointer-events: none;
   }
-
   .btn-close {
     position: absolute;
     right: 8px;
-    background: none;
-    border: none;
+    background: transparent;
+    border: 0;
     cursor: pointer;
-    color: var(--color-foreground-darker, var(--color-foreground));
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    border-radius: 4px;
-    transition:
-      color 0.15s,
-      background 0.15s;
+    color: var(--color-foreground-darker);
+    display: grid;
+    place-items: center;
+    width: 32px;
+    height: 32px;
+    border-radius: 6px;
   }
-
   .btn-close:hover {
-    color: var(--color-background);
-    background: var(--color-focus-round);
+    color: white;
+    background: var(--color-error);
   }
 </style>

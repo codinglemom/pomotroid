@@ -1,14 +1,49 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import type { Theme } from '$lib/types';
+  import type { Theme, TimerStyle } from '$lib/types';
   import { settings } from '$lib/stores/settings';
   import { applyTheme } from '$lib/stores/theme';
   import { getThemes, setSetting, onThemesChanged } from '$lib/ipc';
   import { resolveThemeName } from '$lib/utils/theme';
+  import { isWindows } from '$lib/utils/platform';
   import type { UnlistenFn } from '@tauri-apps/api/event';
   import * as m from '$paraglide/messages.js';
+  import DeskClock from '../../DeskClock.svelte';
+
+  const timerStyles = [
+    ['ring', m.appearance_timer_style_ring],
+    ['flip', m.appearance_timer_style_flip],
+    ['nixie', m.appearance_timer_style_nixie],
+    ['hourglass', m.appearance_timer_style_hourglass],
+  ] as const;
 
   let themes = $state<Theme[]>([]);
+  let preview = $state<number | null>(null);
+  let saving = $state(false);
+  let saveFailed = $state(false);
+  let transparency = $derived(preview ?? $settings.acrylic_transparency);
+  let savingTimerStyle = $state(false);
+  let timerStyleSaveFailed = $state(false);
+
+  $effect(() => {
+    if (preview === null) return;
+    const style = document.documentElement.style;
+    style.setProperty('--glass-preview', `${100 - preview}%`);
+    return () => style.removeProperty('--glass-preview');
+  });
+
+  async function saveTransparency(value: number) {
+    saving = true;
+    saveFailed = false;
+    try {
+      settings.set(await setSetting('acrylic_transparency', String(value)));
+    } catch {
+      saveFailed = true;
+    } finally {
+      preview = null;
+      saving = false;
+    }
+  }
   let osDark = $state(window.matchMedia('(prefers-color-scheme: dark)').matches);
   // Accordion: at most one picker open at a time.
   let openPicker = $state<'light' | 'dark' | null>(null);
@@ -24,6 +59,12 @@
 
   let selectedLightTheme = $derived(themes.find((t) => t.name === $settings.theme_light));
   let selectedDarkTheme = $derived(themes.find((t) => t.name === $settings.theme_dark));
+
+  function themeLabel(name: string) {
+    if (name === 'Pomotroid') return `小番茄 · ${m.appearance_mode_dark()}`;
+    if (name === 'Pomotroid Light') return `小番茄 · ${m.appearance_mode_light()}`;
+    return name;
+  }
 
   function togglePicker(picker: 'light' | 'dark') {
     openPicker = openPicker === picker ? null : picker;
@@ -56,26 +97,41 @@
 
   // Mode selector: save + immediately apply the resolved theme.
   async function setMode(mode: string) {
-    const resolved = resolveThemeName({ ...$settings, theme_mode: mode }, osDark);
+    const updated = await setSetting('theme_mode', mode);
+    settings.set(updated);
+    const resolved = resolveThemeName(updated, osDark);
     const t = themes.find((th) => th.name === resolved);
-    if (t) applyTheme(t);
-    await setSetting('theme_mode', mode);
+    if (t) await applyTheme(t);
+  }
+
+  async function saveTimerStyle(style: TimerStyle) {
+    if (savingTimerStyle || style === $settings.timer_style) return;
+    savingTimerStyle = true;
+    timerStyleSaveFailed = false;
+    try {
+      settings.set(await setSetting('timer_style', style));
+    } catch {
+      timerStyleSaveFailed = true;
+    } finally {
+      savingTimerStyle = false;
+    }
   }
 
   // Light picker: save + apply only if light picker is currently active.
   async function selectLight(theme: Theme) {
-    if (lightIsActive) applyTheme(theme);
-    await setSetting('theme_light', theme.name);
+    settings.set(await setSetting('theme_light', theme.name));
+    if (lightIsActive) await applyTheme(theme);
   }
 
   // Dark picker: save + apply only if dark picker is currently active.
   async function selectDark(theme: Theme) {
-    if (darkIsActive) applyTheme(theme);
-    await setSetting('theme_dark', theme.name);
+    settings.set(await setSetting('theme_dark', theme.name));
+    if (darkIsActive) await applyTheme(theme);
   }
 </script>
 
 <div class="section">
+  <h2 class="page-title">{m.nav_appearance()}</h2>
   <!-- Mode selector -->
   <div class="group-label">{m.appearance_group_mode()}</div>
   <div class="mode-selector">
@@ -83,12 +139,98 @@
       <button
         class="mode-btn"
         class:active={$settings.theme_mode === value}
+        aria-pressed={$settings.theme_mode === value}
         onclick={() => setMode(value)}
       >
-        {label}
+        <span
+          class="mode-preview"
+          class:dark={value === 'dark'}
+          class:auto={value === 'auto'}
+          aria-hidden="true"><i></i></span
+        ><span>{label}</span>
       </button>
     {/each}
   </div>
+
+  <div class="group-label" id="timer-style-label">{m.appearance_timer_style()}</div>
+  <div class="mode-selector timer-style-selector" role="group" aria-labelledby="timer-style-label">
+    {#each timerStyles as [style, label] (style)}
+      <button
+        type="button"
+        class="mode-btn timer-style-btn"
+        class:active={$settings.timer_style === style}
+        aria-pressed={$settings.timer_style === style}
+        aria-disabled={savingTimerStyle}
+        onkeydown={(event) => {
+          if (event.key === ' ' || event.key === 'Enter') event.stopPropagation();
+        }}
+        onclick={() => saveTimerStyle(style)}
+      >
+        <span>{label()}</span>
+        <div class="face-preview" aria-hidden="true">
+          {#if style === 'ring'}
+            <svg viewBox="0 0 64 64" width="50" height="50">
+              <circle
+                cx="32"
+                cy="32"
+                r="29"
+                fill="none"
+                stroke="var(--color-separator)"
+                stroke-width="2.5"
+              />
+              <circle
+                cx="32"
+                cy="32"
+                r="29"
+                fill="none"
+                stroke="var(--color-focus-round)"
+                stroke-width="2.5"
+                pathLength="100"
+                stroke-dasharray="56 100"
+                stroke-linecap="round"
+                transform="rotate(-90 32 32)"
+              />
+              <text
+                x="32"
+                y="37"
+                text-anchor="middle"
+                fill="var(--color-foreground)"
+                font-family="Mona Sans Mono, monospace"
+                font-size="14">14:00</text
+              >
+            </svg>
+          {:else}
+            <div class="mini-face">
+              <DeskClock styleName={style} display="14:00" remainingFraction={0.56} />
+            </div>
+          {/if}
+        </div>
+      </button>
+    {/each}
+  </div>
+  {#if timerStyleSaveFailed}
+    <div class="timer-style-error" role="alert">{m.appearance_timer_style_save_failed()}</div>
+  {/if}
+
+  {#if isWindows}
+    <div class="glass-setting">
+      <label for="glass-transparency">{m.appearance_transparency()}</label>
+      <output for="glass-transparency">{transparency}%</output>
+      <input
+        id="glass-transparency"
+        type="range"
+        min="0"
+        max="100"
+        step="1"
+        value={transparency}
+        aria-valuetext={`${transparency}%`}
+        disabled={saving}
+        oninput={(event) => (preview = event.currentTarget.valueAsNumber)}
+        onchange={(event) => void saveTransparency(event.currentTarget.valueAsNumber)}
+      />
+      {#if saveFailed}<span role="alert">{m.wallet_save_failed()}</span>{/if}
+    </div>
+  {/if}
 
   <!-- Light theme picker -->
   <div class="picker-group">
@@ -102,7 +244,7 @@
         {#if lightIsActive}<span class="active-badge">{m.appearance_badge_active()}</span>{/if}
       </span>
       <span class="trigger-preview">
-        <span class="preview-name">{$settings.theme_light}</span>
+        <span class="preview-name">{themeLabel($settings.theme_light)}</span>
         {#if selectedLightTheme}
           {@const bg = selectedLightTheme.colors['--color-background'] ?? '#2f384b'}
           {@const focusRound = selectedLightTheme.colors['--color-focus-round'] ?? '#e25d60'}
@@ -148,7 +290,7 @@
               <span class="swatch" style="background:{shortRound}"></span>
               <span class="swatch" style="background:{longRound}"></span>
             </span>
-            <span class="card-name" style="color:{fg}">{theme.name}</span>
+            <span class="card-name" style="color:{fg}">{themeLabel(theme.name)}</span>
             <span class="card-right">
               {#if theme.is_custom}
                 <span class="badge" style="color:{accent}">{m.appearance_badge_custom()}</span>
@@ -182,7 +324,7 @@
         {#if darkIsActive}<span class="active-badge">{m.appearance_badge_active()}</span>{/if}
       </span>
       <span class="trigger-preview">
-        <span class="preview-name">{$settings.theme_dark}</span>
+        <span class="preview-name">{themeLabel($settings.theme_dark)}</span>
         {#if selectedDarkTheme}
           {@const bg = selectedDarkTheme.colors['--color-background'] ?? '#2f384b'}
           {@const focusRound = selectedDarkTheme.colors['--color-focus-round'] ?? '#e25d60'}
@@ -228,7 +370,7 @@
               <span class="swatch" style="background:{shortRound}"></span>
               <span class="swatch" style="background:{longRound}"></span>
             </span>
-            <span class="card-name" style="color:{fg}">{theme.name}</span>
+            <span class="card-name" style="color:{fg}">{themeLabel(theme.name)}</span>
             <span class="card-right">
               {#if theme.is_custom}
                 <span class="badge" style="color:{accent}">{m.appearance_badge_custom()}</span>
@@ -252,6 +394,23 @@
 </div>
 
 <style>
+  .glass-setting {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 8px;
+    margin: 12px 20px;
+  }
+  .glass-setting input,
+  .glass-setting [role='alert'] {
+    grid-column: 1 / -1;
+  }
+  .glass-setting input {
+    width: 100%;
+    accent-color: var(--color-accent);
+  }
+  .glass-setting output {
+    font-variant-numeric: tabular-nums;
+  }
   .section {
     display: flex;
     flex-direction: column;
@@ -472,5 +631,123 @@
     letter-spacing: 0.06em;
     text-transform: uppercase;
     opacity: 0.8;
+  }
+
+  .page-title {
+    margin: 24px 24px 4px;
+    font-size: 20px;
+    line-height: 28px;
+    font-weight: 600;
+  }
+  .group-label {
+    padding: 16px 24px 10px;
+    font-size: 12px;
+    opacity: 1;
+    letter-spacing: 0;
+    text-transform: none;
+  }
+  .mode-selector {
+    margin: 0 24px 8px;
+    gap: 12px;
+    border: 0;
+    overflow: visible;
+  }
+  .mode-btn {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 0;
+    padding: 8px;
+    border: 1px solid var(--color-separator);
+    border-radius: 8px;
+    background: var(--surface-panel);
+    text-align: left;
+    font-size: 12px;
+    letter-spacing: 0;
+  }
+  .mode-btn:last-child {
+    border-right: 1px solid var(--color-separator);
+  }
+  .mode-btn.active {
+    border: 2px solid var(--color-accent);
+    padding: 7px;
+    background: var(--surface-panel);
+    color: var(--color-foreground);
+  }
+  .timer-style-btn {
+    align-items: center;
+    justify-content: center;
+    min-height: 36px;
+    text-align: center;
+  }
+  .timer-style-selector {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 8px;
+  }
+  .face-preview {
+    display: grid;
+    place-items: center;
+    width: 100%;
+    height: 54px;
+    pointer-events: none;
+  }
+  .mini-face {
+    width: 250px;
+    zoom: 0.32;
+  }
+  .timer-style-error {
+    margin: 0 24px 8px;
+    font-size: 12px;
+  }
+  .mode-preview {
+    height: 62px;
+    width: 100%;
+    border: 1px solid #d9ded6;
+    border-radius: 4px;
+    background: #f5f5f2;
+    display: grid;
+    place-items: center;
+  }
+  .mode-preview.dark {
+    background: #202321;
+    border-color: #414a42;
+  }
+  .mode-preview.auto {
+    background: linear-gradient(90deg, #f5f5f2 50%, #202321 50%);
+  }
+  .mode-preview i {
+    width: 30px;
+    height: 30px;
+    border: 2px solid #b44f40;
+    border-radius: 50%;
+  }
+  .mode-preview.dark i {
+    border-color: #f0a08e;
+  }
+  .picker-group {
+    margin: 12px 24px 0;
+    border-radius: 10px;
+    background: var(--surface-panel);
+  }
+  .picker-trigger {
+    min-height: 52px;
+    padding: 12px 16px;
+    flex-wrap: wrap;
+  }
+  .trigger-label {
+    opacity: 1;
+    font-size: 12px;
+    letter-spacing: 0;
+    text-transform: none;
+  }
+  .preview-name {
+    opacity: 1;
+    font-size: 12px;
+  }
+  .active-badge {
+    font-size: 11px;
+    letter-spacing: 0;
+    text-transform: none;
   }
 </style>

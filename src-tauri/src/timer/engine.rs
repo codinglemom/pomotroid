@@ -413,23 +413,23 @@ mod tests {
         let (handle, rx) = spawn(10, TICK);
         handle.send(TimerCommand::Start);
 
-        // Let 3 ticks fire, then suspend.
-        std::thread::sleep(TICK * 3 + TICK / 2);
+        // Wait for the engine to reach the intended position before suspending.
+        loop {
+            if let TimerEvent::Tick { elapsed_secs: 3, .. } =
+                rx.recv_timeout(Duration::from_secs(2)).expect("expected timer ticks")
+            {
+                break;
+            }
+        }
         handle.send(TimerCommand::Suspend);
 
-        let before = drain(&rx);
-        let suspended_elapsed = before.iter().find_map(|e| {
-            if let TimerEvent::Suspended { elapsed_secs } = e {
-                Some(*elapsed_secs)
-            } else {
-                None
+        let saved = loop {
+            if let TimerEvent::Suspended { elapsed_secs } =
+                rx.recv_timeout(Duration::from_secs(2)).expect("expected Suspended event")
+            {
+                break elapsed_secs;
             }
-        });
-        assert!(
-            suspended_elapsed.is_some(),
-            "expected Suspended event with elapsed_secs"
-        );
-        let saved = suspended_elapsed.unwrap();
+        };
         assert!(saved >= 3, "elapsed at suspend should be >= 3 s, got {saved}");
 
         // Gap: simulate OS sleep (no ticks must fire).

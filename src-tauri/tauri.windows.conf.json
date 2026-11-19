@@ -1,0 +1,21 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "app": {
+    "windows": [
+      {
+        "title": "小番茄",
+        "width": 360,
+        "height": 478,
+        "minWidth": 240,
+        "minHeight": 240,
+        "resizable": true,
+        "decorations": false,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "transparent": true,
+        "backgroundColor": "#00000000",
+        "visible": false
+      }
+    ]
+  }
+}

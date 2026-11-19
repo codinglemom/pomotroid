@@ -1,7 +1,7 @@
 <script lang="ts">
   import '../../app.css';
-  import { onMount } from 'svelte';
-  import { getSettings, getThemes, onSettingsChanged, onThemesChanged } from '$lib/ipc';
+  import { onMount, tick } from 'svelte';
+  import { getSettings, getThemes, watchWindowSettings, onThemesChanged } from '$lib/ipc';
   import { settings } from '$lib/stores/settings';
   import { applyTheme } from '$lib/stores/theme';
   import { resolveThemeName } from '$lib/utils/theme';
@@ -15,24 +15,44 @@
   import TimerSection from '$lib/components/settings/sections/TimerSection.svelte';
   import AppearanceSection from '$lib/components/settings/sections/AppearanceSection.svelte';
   import NotificationsSection from '$lib/components/settings/sections/NotificationsSection.svelte';
+  import RewardsSection from '$lib/components/settings/sections/RewardsSection.svelte';
+  import { WINDOW_NAVIGATE } from '$lib/utils/windows';
   import ShortcutsSection from '$lib/components/settings/sections/ShortcutsSection.svelte';
   import SystemSection from '$lib/components/settings/sections/SystemSection.svelte';
   import AboutSection from '$lib/components/settings/sections/AboutSection.svelte';
 
   import * as m from '$paraglide/messages.js';
+  import Icon, { type IconName } from '$lib/components/Icon.svelte';
 
-  type Section = 'timer' | 'appearance' | 'notifications' | 'shortcuts' | 'system' | 'about';
+  type Section =
+    | 'timer'
+    | 'appearance'
+    | 'notifications'
+    | 'rewards'
+    | 'shortcuts'
+    | 'system'
+    | 'about';
 
   const SECTIONS: { id: Section; label: () => string }[] = [
     { id: 'timer', label: m.nav_timer },
     { id: 'appearance', label: m.nav_appearance },
     { id: 'notifications', label: m.nav_notifications },
+    { id: 'rewards', label: m.wallet_title },
     { id: 'shortcuts', label: m.nav_shortcuts },
     { id: 'system', label: m.nav_system },
     { id: 'about', label: m.nav_about },
   ];
 
   let active = $state<Section>('timer');
+  const sectionIcons: Record<Section, IconName> = {
+    timer: 'clock',
+    appearance: 'palette',
+    notifications: 'bell',
+    rewards: 'wallet',
+    shortcuts: 'keyboard',
+    system: 'settings',
+    about: 'info',
+  };
 
   // Local shortcut state for the settings window.
   let localVolume = $state(1.0);
@@ -41,6 +61,9 @@
 
   onMount(() => {
     const cleanups: UnlistenFn[] = [];
+    let disposed = false;
+    const section = new URLSearchParams(window.location.search).get('section');
+    if (section === 'rewards') active = section;
 
     // Mount local keyboard shortcut handler.
     const shortcutHandler = createLocalShortcutHandler({
@@ -62,23 +85,36 @@
     cleanups.push(() => document.removeEventListener('keydown', shortcutHandler));
 
     (async () => {
+      const unlisten = await getCurrentWebviewWindow().listen<string>(
+        WINDOW_NAVIGATE,
+        ({ payload }) => {
+          if (payload === 'rewards') active = payload;
+        }
+      );
+      if (disposed) {
+        unlisten();
+        return;
+      }
+      cleanups.push(unlisten);
       try {
-        const s = await getSettings();
+        const [s, themes] = await Promise.all([getSettings(), getThemes()]);
         settings.set(s);
         localVolume = s.volume;
 
         // Apply the stored locale on mount.
         setLocale(s.language);
-        await info(`[settings] settings loaded, locale=${s.language}`);
+        void info(`[settings] settings loaded, locale=${s.language}`).catch(() => {});
 
-        const themes = await getThemes();
         const osDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
         const activeTheme = themes.find((t) => t.name === resolveThemeName(s, osDark)) ?? themes[0];
-        if (activeTheme) applyTheme(activeTheme);
-        await info(`[settings] initialized, theme=${activeTheme?.name ?? 'none'}`);
+        if (activeTheme) await applyTheme(activeTheme);
+        void info(`[settings] initialized, theme=${activeTheme?.name ?? 'none'}`).catch(() => {});
 
-        // Show the window now that the theme is applied (avoids white flash)
+        // Flush localized controls and wait for local fonts before revealing the window.
+        await tick();
+        await document.fonts.ready;
         await getCurrentWebviewWindow().show();
+        await getCurrentWebviewWindow().setFocus();
       } catch (e) {
         await logError(`[settings] initialization failed: ${e}`);
         throw e;
@@ -96,7 +132,7 @@
       cleanups.push(() => mq.removeEventListener('change', mqListener));
 
       cleanups.push(
-        await onSettingsChanged(async (updated) => {
+        await watchWindowSettings(async (updated) => {
           const prevMode = $settings.theme_mode;
           const prevLight = $settings.theme_light;
           const prevDark = $settings.theme_dark;
@@ -127,6 +163,7 @@
     })();
 
     return () => {
+      disposed = true;
       for (const fn of cleanups) fn();
     };
   });
@@ -143,11 +180,12 @@
           <button
             class="nav-item"
             class:active={active === section.id}
+            aria-current={active === section.id ? 'page' : undefined}
             onclick={() => {
               active = section.id;
             }}
           >
-            {section.label()}
+            <Icon name={sectionIcons[section.id]} size={18} />{section.label()}
           </button>
         {/each}
       </nav>
@@ -161,6 +199,8 @@
         <AppearanceSection />
       {:else if active === 'notifications'}
         <NotificationsSection />
+      {:else if active === 'rewards'}
+        <RewardsSection />
       {:else if active === 'shortcuts'}
         <ShortcutsSection />
       {:else if active === 'system'}
@@ -179,58 +219,62 @@
     display: flex;
     flex-direction: column;
     overflow: hidden;
-    background: var(--color-background);
-    animation: app-fade-in 0.2s ease both;
+    background: transparent;
   }
-
   .body {
     flex: 1;
     min-height: 0;
     display: flex;
     overflow: hidden;
   }
-
-  /* Sidebar */
   .sidebar {
-    width: 180px;
+    width: 168px;
     flex-shrink: 0;
     border-right: 1px solid var(--color-separator);
-    background: var(--color-background-light);
+    background: var(--surface-sidebar);
     overflow-y: auto;
-    padding: 8px 0;
+    padding: 16px 10px;
   }
-
+  nav {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
   .nav-item {
-    display: block;
+    display: flex;
+    align-items: center;
+    gap: 12px;
     width: 100%;
-    padding: 9px 16px;
-    background: none;
-    border: none;
-    border-left: 3px solid transparent;
+    min-height: 38px;
+    padding: 8px 12px;
+    border: 0;
+    border-radius: 6px;
     text-align: left;
-    font-size: 0.85rem;
-    letter-spacing: 0.03em;
-    color: var(--color-foreground-darker, var(--color-foreground));
+    font-size: 14px;
+    color: var(--color-foreground-darker);
+    background: transparent;
     cursor: pointer;
-    transition:
-      color 0.12s,
-      background 0.12s,
-      border-color 0.12s;
+    position: relative;
   }
-
   .nav-item:hover {
     color: var(--color-foreground);
     background: var(--color-hover);
   }
-
   .nav-item.active {
     color: var(--color-foreground);
-    border-left-color: var(--color-accent);
-    background: var(--color-hover);
+    background: var(--surface-panel);
     font-weight: 500;
   }
-
-  /* Content */
+  .nav-item.active::before {
+    content: '';
+    position: absolute;
+    left: 2px;
+    top: 10px;
+    bottom: 10px;
+    width: 3px;
+    border-radius: 3px;
+    background: var(--color-accent);
+  }
   .content {
     flex: 1;
     overflow-y: auto;

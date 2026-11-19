@@ -25,14 +25,26 @@
 
 :root {
   /* Theme colors (defaults; overridden by the active theme at runtime) */
-  --color-long-round: #c75000;
-  --color-short-round: #417505;
-  --color-focus-round: #b01c2e;
-  --color-background: #2f384b;
-  --color-background-light: #3e4a5d;
-  --color-foreground: #d7e1f4;
-  --color-foreground-darker: #a3aec4;
-  --color-accent: #ff6347;
+  --color-long-round: #496c96;
+  --color-short-round: #44745b;
+  --color-focus-round: #b44f40;
+  --color-background: #f5f5f2;
+  --color-background-light: #ffffff;
+  --color-foreground: #252c27;
+  --color-foreground-darker: #505d55;
+  --color-accent: #b44f40;
+  --color-income: #356d4b;
+  --color-expense: #b13f4b;
+  --color-error: #a82e3d;
+  --color-on-accent: #ffffff;
+  --color-on-focus-round: #ffffff;
+  --color-on-short-round: #ffffff;
+  --color-on-long-round: #ffffff;
+  --surface-panel: var(--color-background-light);
+  --surface-sidebar: color-mix(in srgb, var(--color-background) 94%, var(--color-foreground));
+  --control-border: color-mix(in srgb, var(--color-foreground) 48%, var(--color-background));
+  --radius-control: 6px;
+  --radius-panel: 10px;
 
   /* Derived chrome tokens — adapt automatically between dark and light themes.
      color-mix with transparent produces the foreground color at N% opacity,
@@ -63,10 +75,130 @@ body {
   height: 100%;
   width: 100%;
   overflow: hidden;
-  font-family: 'Mona Sans', system-ui, sans-serif;
+  font-family: 'Mona Sans', 'Segoe UI', 'Microsoft YaHei UI', system-ui, sans-serif;
   background-color: var(--color-background);
   color: var(--color-foreground);
   user-select: none;
+}
+
+body {
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+html[data-material='acrylic'] {
+  background: transparent;
+  --surface-panel: color-mix(in srgb, var(--color-background-light) 50%, transparent);
+  --surface-sidebar: color-mix(in srgb, var(--color-background-light) 22%, transparent);
+}
+
+html[data-material='acrylic'] body {
+  background:
+    linear-gradient(145deg, rgb(255 255 255 / 12%), transparent 60%),
+    color-mix(
+      in srgb,
+      var(--color-background) var(--glass-preview, var(--glass-tint, 52%)),
+      transparent
+    );
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 30%);
+}
+
+html[data-material='acrylic'][data-color-mode='dark'] body {
+  background:
+    linear-gradient(145deg, rgb(255 255 255 / 4%), transparent 60%),
+    color-mix(
+      in srgb,
+      var(--color-background) var(--glass-preview, var(--glass-tint, 52%)),
+      transparent
+    );
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 12%);
+}
+
+html[data-material='acrylic'] body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  opacity: 0.035;
+  background: url('/textures/acrylic-grain.png') repeat;
+  pointer-events: none;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+summary:focus-visible,
+a:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+button:disabled {
+  cursor: default;
+}
+
+.ui-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 36px;
+  padding: 7px 14px;
+  border: 1px solid var(--color-separator);
+  border-radius: var(--radius-control);
+  color: var(--color-foreground);
+  background: var(--surface-panel);
+  cursor: pointer;
+  font-size: 14px;
+  transition: background var(--transition-snappy);
+}
+.ui-button:hover:enabled {
+  background: var(--color-hover);
+}
+.ui-button.primary {
+  background: var(--color-accent);
+  color: var(--color-on-accent);
+  border-color: transparent;
+}
+.ui-button.primary:hover:enabled {
+  background: color-mix(in srgb, var(--color-accent) 90%, var(--color-foreground));
+}
+.ui-button:disabled {
+  opacity: 0.55;
+}
+.ui-icon-button {
+  padding: 0;
+  width: 32px;
+  min-height: 32px;
+  background: transparent;
+  border-color: transparent;
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }
 
 /* ---------------------------------------------------------------------------

@@ -13,7 +13,7 @@
   let { label, checked, description, tooltip, onclick }: Props = $props();
 </script>
 
-<button class="row" {onclick}>
+<button class="row" {onclick} role="switch" aria-checked={checked}>
   <span class="text">
     <span class="label"
       >{label}{#if tooltip}<TooltipInfo text={tooltip} />{/if}</span
@@ -22,7 +22,7 @@
       <span class="desc">{description}</span>
     {/if}
   </span>
-  <span class="toggle" class:on={checked} aria-checked={checked} role="switch"></span>
+  <span class="toggle" class:on={checked} aria-hidden="true"></span>
 </button>
 
 <style>
@@ -31,7 +31,7 @@
     align-items: center;
     justify-content: space-between;
     width: 100%;
-    padding: 10px 20px;
+    padding: 14px 24px;
     background: none;
     border: none;
     border-bottom: 1px solid var(--color-separator);
@@ -59,10 +59,9 @@
   }
 
   .desc {
-    font-size: 0.72rem;
+    font-size: 12px;
     color: var(--color-foreground-darker, var(--color-foreground));
     letter-spacing: 0.02em;
-    opacity: 0.7;
   }
 
   /* Pill toggle */
@@ -103,6 +102,6 @@
     /* ON state: the background color is always chosen by the theme designer to
        contrast with the accent, so it reads cleanly and stays within the palette.
        e.g. dark navy on teal (Pomotroid), dark charcoal on yellow (Gruvbox). */
-    background: var(--color-background);
+    background: var(--color-on-accent);
   }
 </style>

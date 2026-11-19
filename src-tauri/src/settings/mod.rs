@@ -3,6 +3,31 @@ pub mod defaults;
 use rusqlite::{params, Connection, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::str::FromStr;
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TimerStyle {
+    #[default]
+    Ring,
+    Flip,
+    Nixie,
+    Hourglass,
+}
+
+impl FromStr for TimerStyle {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "ring" => Ok(Self::Ring),
+            "flip" => Ok(Self::Flip),
+            "nixie" => Ok(Self::Nixie),
+            "hourglass" => Ok(Self::Hourglass),
+            _ => Err("timer_style must be ring, flip, nixie, or hourglass"),
+        }
+    }
+}
 
 /// All user-configurable settings, fully typed.
 ///
@@ -26,9 +51,12 @@ pub struct Settings {
     pub long_breaks_enabled: bool,
     /// When true the dial arc starts full and subtracts; when false it fills from empty.
     pub dial_countdown: bool,
+    pub timer_style: TimerStyle,
     pub theme_mode: String,
     pub theme_light: String,
     pub theme_dark: String,
+    /// Acrylic surface transparency on an integer 0–100 scale.
+    pub acrylic_transparency: u32,
     pub tick_sounds_during_work: bool,
     pub tick_sounds_during_break: bool,
     /// Work round duration in seconds.
@@ -82,9 +110,11 @@ impl Default for Settings {
             short_breaks_enabled: true,
             long_breaks_enabled: true,
             dial_countdown: true,
+            timer_style: TimerStyle::default(),
             theme_mode: "auto".to_string(),
-            theme_light: "Pomotroid Light".to_string(),
-            theme_dark: "Pomotroid".to_string(),
+            theme_light: "Fluent Calm Light".to_string(),
+            theme_dark: "Fluent Calm Dark".to_string(),
+            acrylic_transparency: 48,
             tick_sounds_during_work: false,
             tick_sounds_during_break: false,
             time_work_secs: 25 * 60,
@@ -191,6 +221,10 @@ pub fn load(conn: &Connection) -> Result<Settings> {
         short_breaks_enabled: parse_bool(&map, "short_breaks_enabled", d.short_breaks_enabled),
         long_breaks_enabled: parse_bool(&map, "long_breaks_enabled", d.long_breaks_enabled),
         dial_countdown: parse_bool(&map, "dial_countdown", d.dial_countdown),
+        timer_style: map
+            .get("timer_style")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(d.timer_style),
         theme_mode: map
             .get("theme_mode")
             .cloned()
@@ -203,6 +237,10 @@ pub fn load(conn: &Connection) -> Result<Settings> {
             .get("theme_dark")
             .cloned()
             .unwrap_or(d.theme_dark),
+        acrylic_transparency: map
+            .get("acrylic_transparency")
+            .and_then(|value| validate_acrylic_transparency(value).ok())
+            .unwrap_or(d.acrylic_transparency),
         tick_sounds_during_work: parse_bool(&map, "tick_sounds_work", d.tick_sounds_during_work),
         tick_sounds_during_break: parse_bool(
             &map,
@@ -272,6 +310,14 @@ pub fn get_setting(conn: &Connection, key: &str) -> Option<String> {
     .ok()
 }
 
+pub fn validate_acrylic_transparency(value: &str) -> std::result::Result<u32, String> {
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|value| *value <= 100)
+        .ok_or_else(|| "acrylic_transparency must be an integer from 0 to 100".to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
@@ -337,9 +383,11 @@ mod tests {
         assert!(!s.always_on_top);
         assert!(!s.websocket_enabled);
         assert_eq!(s.websocket_port, 1314);
+        assert_eq!(s.timer_style, TimerStyle::Ring);
         assert_eq!(s.theme_mode, "auto");
-        assert_eq!(s.theme_light, "Pomotroid Light");
-        assert_eq!(s.theme_dark, "Pomotroid");
+        assert_eq!(s.theme_light, "Fluent Calm Light");
+        assert_eq!(s.theme_dark, "Fluent Calm Dark");
+        assert_eq!(s.acrylic_transparency, 48);
         assert_eq!(s.language, "auto");
         assert!(!s.verbose_logging);
     }
@@ -350,9 +398,13 @@ mod tests {
         seed_defaults(&conn).unwrap();
         // Second seed must not overwrite existing values.
         save_setting(&conn, "always_on_top", "true").unwrap();
+        save_setting(&conn, "theme_light", "Pomotroid Light").unwrap();
+        save_setting(&conn, "theme_dark", "Pomotroid").unwrap();
         seed_defaults(&conn).unwrap();
         let s = load(&conn).unwrap();
         assert!(s.always_on_top, "seed_defaults must not overwrite saved value");
+        assert_eq!(s.theme_light, "Pomotroid Light");
+        assert_eq!(s.theme_dark, "Pomotroid");
     }
 
     #[test]
@@ -371,6 +423,104 @@ mod tests {
         save_setting(&conn, "volume", "50").unwrap();
         let s = load(&conn).unwrap();
         assert!((s.volume - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn timer_styles_survive_database_reopen_and_serialize_to_ipc_names() {
+        let path = std::env::temp_dir().join(format!(
+            "pomotroid-timer-style-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for (value, expected) in [
+            ("ring", TimerStyle::Ring),
+            ("flip", TimerStyle::Flip),
+            ("nixie", TimerStyle::Nixie),
+            ("hourglass", TimerStyle::Hourglass),
+        ] {
+            {
+                let conn = Connection::open(&path).unwrap();
+                migrations::run(&conn).unwrap();
+                let style: TimerStyle = value.parse().unwrap();
+                assert_eq!(style, expected);
+                save_setting(&conn, "timer_style", value).unwrap();
+            }
+            let conn = Connection::open(&path).unwrap();
+            seed_defaults(&conn).unwrap();
+            let loaded = load(&conn).unwrap();
+            assert_eq!(loaded.timer_style, expected);
+            assert_eq!(serde_json::to_value(loaded).unwrap()["timer_style"], value);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn timer_style_rejects_unsupported_values_and_loads_ring_for_invalid_rows() {
+        let conn = setup();
+        assert_eq!(load(&conn).unwrap().timer_style, TimerStyle::Ring);
+        seed_defaults(&conn).unwrap();
+        assert_eq!(get_setting(&conn, "timer_style").as_deref(), Some("ring"));
+
+        for value in ["", "Flip", "clock", "nixie ", "Hourglass"] {
+            assert!(value.parse::<TimerStyle>().is_err(), "accepted {value:?}");
+            save_setting(&conn, "timer_style", value).unwrap();
+            assert_eq!(load(&conn).unwrap().timer_style, TimerStyle::Ring);
+        }
+    }
+
+    #[test]
+    fn acrylic_transparency_accepts_only_integers_in_range() {
+        for value in ["0", "48", "100"] {
+            assert_eq!(validate_acrylic_transparency(value).unwrap().to_string(), value);
+        }
+        for value in ["-1", "101", "4294967296", "48.5", "48.0", "", "NaN", "true"] {
+            assert!(validate_acrylic_transparency(value).is_err(), "accepted {value}");
+        }
+    }
+
+    #[test]
+    fn acrylic_transparency_survives_database_reopen_and_reseed() {
+        let path = std::env::temp_dir().join(format!(
+            "pomotroid-acrylic-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        {
+            let conn = Connection::open(&path).unwrap();
+            migrations::run(&conn).unwrap();
+            seed_defaults(&conn).unwrap();
+            save_setting(&conn, "acrylic_transparency", "73").unwrap();
+        }
+        {
+            let conn = Connection::open(&path).unwrap();
+            seed_defaults(&conn).unwrap();
+            assert_eq!(load(&conn).unwrap().acrylic_transparency, 73);
+            for value in ["0", "100"] {
+                save_setting(&conn, "acrylic_transparency", value).unwrap();
+                assert_eq!(load(&conn).unwrap().acrylic_transparency.to_string(), value);
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn acrylic_transparency_missing_or_invalid_uses_default() {
+        let conn = setup();
+        save_setting(&conn, "theme_light", "Pomotroid Light").unwrap();
+        assert_eq!(load(&conn).unwrap().acrylic_transparency, 48);
+        seed_defaults(&conn).unwrap();
+        assert_eq!(get_setting(&conn, "acrylic_transparency").as_deref(), Some("48"));
+        assert_eq!(load(&conn).unwrap().theme_light, "Pomotroid Light");
+        for value in ["-1", "101", "48.5", "garbage"] {
+            save_setting(&conn, "acrylic_transparency", value).unwrap();
+            assert_eq!(load(&conn).unwrap().acrylic_transparency, 48);
+        }
     }
 
     #[test]
@@ -408,8 +558,10 @@ mod tests {
         save_setting(&conn, "time_short_break_secs", "600").unwrap();
         save_setting(&conn, "work_rounds", "8").unwrap();
         save_setting(&conn, "always_on_top", "true").unwrap();
+        save_setting(&conn, "timer_style", "hourglass").unwrap();
 
         // Simulate the reset_defaults command: wipe all rows then re-seed.
+        save_setting(&conn, "acrylic_transparency", "100").unwrap();
         conn.execute("DELETE FROM settings", []).unwrap();
         seed_defaults(&conn).unwrap();
 
@@ -420,6 +572,8 @@ mod tests {
         assert_eq!(s.long_break_interval, 4, "work rounds must reset to 4");
         // Non-timer settings are also wiped and reseeded to their defaults.
         assert!(!s.always_on_top, "always_on_top must reset to default false");
+        assert_eq!(s.acrylic_transparency, 48);
+        assert_eq!(s.timer_style, TimerStyle::Ring);
     }
 
     #[test]
@@ -428,11 +582,20 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         // Run only migration 1 manually to get v1 state.
         conn.execute_batch("BEGIN; CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL); INSERT INTO schema_version VALUES (1); COMMIT;").unwrap();
+        // Later migrations also evolve sessions; model the complete v1 table.
+        conn.execute_batch("CREATE TABLE sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at INTEGER NOT NULL,
+            ended_at INTEGER,
+            round_type TEXT NOT NULL,
+            duration_secs INTEGER NOT NULL,
+            completed INTEGER NOT NULL DEFAULT 0
+        );").unwrap();
         conn.execute("INSERT INTO settings (key, value) VALUES ('time_work_mins', '30')", []).unwrap();
         conn.execute("INSERT INTO settings (key, value) VALUES ('time_short_break_mins', '7')", []).unwrap();
         conn.execute("INSERT INTO settings (key, value) VALUES ('time_long_break_mins', '20')", []).unwrap();
 
-        // Now run the full migration suite — only MIGRATION_2 should fire.
+        // Run pending migrations, including the duration-key conversion.
         crate::db::migrations::run(&conn).unwrap();
 
         // New keys must exist with correct second values.
